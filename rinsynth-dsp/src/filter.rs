@@ -159,15 +159,25 @@ impl Filter for SVFilter {
         self.low += self.f * self.band;
         flush_denormal(&mut self.low);
 
+        // Saturations are load-bearing only when states exceed unity —
+        // fast_tanh is identity-ish below that, so gate on magnitude
+        // (skips two f32 divisions in the common small-signal case while
+        // preserving the clamp that prevents state blowup at high Q).
         let feedback = self.q * self.band;
-        let saturated_feedback = fast_tanh(feedback);
+        let saturated_feedback = if feedback.abs() > 1.0 {
+            fast_tanh(feedback)
+        } else {
+            feedback
+        };
 
         self.high = input - self.low - saturated_feedback;
         self.band += self.f * self.high;
         flush_denormal(&mut self.band);
 
         // Gentle saturation on state variables for analog character
-        self.band = fast_tanh(self.band);
+        if self.band.abs() > 1.0 {
+            self.band = fast_tanh(self.band);
+        }
 
         // Soft clip the output to prevent blowup at high resonance
         self.low = soft_clip_filter(self.low);
