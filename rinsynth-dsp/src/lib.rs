@@ -7,12 +7,14 @@
 //! Xtensa LLVM-21 serde-f32 codegen issue, esp-rs/rust#277).
 
 pub mod effects;
+pub mod embedded;
 pub mod envelope;
 pub mod filter;
 pub mod oscillator;
 pub mod voice;
 
 pub use effects::{Chorus, Delay, Distortion, Effect, EffectsChain, Reverb};
+pub use embedded::EmbeddedEngine;
 pub use envelope::{ADSREnvelope, AREnvelope, Envelope, EnvelopeState};
 pub use filter::{cc_to_cutoff, cc_to_resonance, Filter, FilterMode, SVFilter};
 pub use oscillator::{

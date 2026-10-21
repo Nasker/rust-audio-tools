@@ -26,7 +26,7 @@ fn sine_lut_table() -> &'static [f32; SINE_LUT_SIZE] {
 #[inline]
 #[link_section = ".iram1.text"]
 
-fn sine_lut(phase: f32) -> f32 {
+pub(crate) fn sine_lut(phase: f32) -> f32 {
     let table = sine_lut_table();
     let mut p = phase;
     if p >= 2.0 * PI {
