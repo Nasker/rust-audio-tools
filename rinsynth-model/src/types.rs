@@ -14,12 +14,16 @@ impl StereoSample {
         right: 0.0,
     };
 
+    #[inline]
+
     pub fn new(left: Sample, right: Sample) -> Self {
         Self { left, right }
     }
 
     /// Create stereo from mono with equal power panning
     /// pan: -1.0 = full left, 0.0 = center, 1.0 = full right
+    #[inline]
+
     pub fn from_mono_panned(sample: Sample, pan: f32) -> Self {
         // Equal power panning using sine/cosine
         let pan_normalized = (pan + 1.0) * 0.5; // 0.0 to 1.0
@@ -31,6 +35,8 @@ impl StereoSample {
     }
 
     /// Create stereo from mono (centered)
+    #[inline]
+
     pub fn from_mono(sample: Sample) -> Self {
         Self {
             left: sample,
@@ -39,6 +45,8 @@ impl StereoSample {
     }
 
     /// Mix two stereo samples
+    #[inline]
+
     pub fn mix(self, other: StereoSample) -> Self {
         Self {
             left: self.left + other.left,
@@ -47,6 +55,8 @@ impl StereoSample {
     }
 
     /// Scale by amplitude
+    #[inline]
+
     pub fn scale(self, amp: f32) -> Self {
         Self {
             left: self.left * amp,
@@ -55,6 +65,8 @@ impl StereoSample {
     }
 
     /// Apply stereo width (0.0 = mono, 1.0 = normal, 2.0 = extra wide)
+    #[inline]
+
     pub fn with_width(self, width: f32) -> Self {
         let mid = (self.left + self.right) * 0.5;
         let side = (self.left - self.right) * 0.5;
@@ -67,6 +79,8 @@ impl StereoSample {
 
 impl std::ops::Add for StereoSample {
     type Output = Self;
+    #[inline]
+
     fn add(self, other: Self) -> Self {
         Self {
             left: self.left + other.left,
@@ -76,6 +90,8 @@ impl std::ops::Add for StereoSample {
 }
 
 impl std::ops::AddAssign for StereoSample {
+    #[inline]
+
     fn add_assign(&mut self, other: Self) {
         self.left += other.left;
         self.right += other.right;
@@ -84,6 +100,8 @@ impl std::ops::AddAssign for StereoSample {
 
 impl std::ops::Mul<f32> for StereoSample {
     type Output = Self;
+    #[inline]
+
     fn mul(self, scalar: f32) -> Self {
         Self {
             left: self.left * scalar,

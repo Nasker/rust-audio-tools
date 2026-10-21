@@ -1,0 +1,12 @@
+[package]
+name = "rinsynth-dsp"
+version = "0.1.0"
+edition = "2021"
+description = "Portable DSP core of RustInSynth — voices, oscillators, filters, envelopes, effects. Shared by the desktop host and the ESP32-S3 firmware port."
+
+[dependencies]
+rinsynth-model = { path = "../rinsynth-model", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.8"
+plotters = "0.3"

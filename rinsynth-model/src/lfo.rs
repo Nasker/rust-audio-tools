@@ -92,6 +92,8 @@ impl LFO {
     }
 
     /// Set LFO rate in Hz (0.1 to 20)
+    #[inline]
+
     pub fn set_rate(&mut self, rate: f32) {
         self.rate = rate.clamp(0.1, 20.0);
         self.update_phase_increment();
@@ -103,6 +105,8 @@ impl LFO {
     }
 
     /// Set modulation depth (0.0 to 1.0)
+    #[inline]
+
     pub fn set_depth(&mut self, depth: f32) {
         self.depth = depth.clamp(0.0, 1.0);
     }
@@ -113,6 +117,8 @@ impl LFO {
     }
 
     /// Set waveform
+    #[inline]
+
     pub fn set_waveform(&mut self, waveform: LfoWaveform) {
         self.waveform = waveform;
         // Reset random state when switching to/from random
@@ -139,6 +145,8 @@ impl LFO {
     /// Generate next modulation value (-1.0 to +1.0).
     /// Routing is handled by the mod matrix, so the LFO always runs once a
     /// nonzero depth is set.
+    #[inline]
+
     pub fn next_value(&mut self) -> f32 {
         if self.depth == 0.0 {
             return 0.0;
@@ -157,6 +165,8 @@ impl LFO {
     }
 
     /// Generate next sine wave value (-1.0 to +1.0)
+    #[inline]
+
     fn next_sine(&mut self) -> f32 {
         let value = self.phase.sin();
         self.advance_phase();
@@ -164,6 +174,8 @@ impl LFO {
     }
 
     /// Generate next triangle wave value (-1.0 to +1.0)
+    #[inline]
+
     fn next_triangle(&mut self) -> f32 {
         // Convert phase to triangle: peak at π/2, valley at 3π/2
         let normalized_phase = self.phase / (2.0 * PI);
@@ -179,6 +191,8 @@ impl LFO {
     }
 
     /// Generate next square wave value (-1.0 to +1.0)
+    #[inline]
+
     fn next_square(&mut self) -> f32 {
         let value = if self.phase < PI { 1.0 } else { -1.0 };
         self.advance_phase();
@@ -186,6 +200,8 @@ impl LFO {
     }
 
     /// Generate next saw wave value (-1.0 to +1.0, falling)
+    #[inline]
+
     fn next_saw(&mut self) -> f32 {
         let value = 1.0 - 2.0 * self.phase / (2.0 * PI);
         self.advance_phase();
@@ -193,6 +209,8 @@ impl LFO {
     }
 
     /// Generate next random/S&H value (-1.0 to +1.0)
+    #[inline]
+
     fn next_random(&mut self) -> f32 {
         // Sample new value when phase wraps
         if self.phase < self.last_random_phase {
@@ -205,6 +223,8 @@ impl LFO {
     }
 
     /// Advance phase by one sample
+    #[inline]
+
     fn advance_phase(&mut self) {
         self.phase += self.phase_increment;
         if self.phase >= 2.0 * PI {
@@ -213,6 +233,8 @@ impl LFO {
     }
 
     /// Update phase increment based on rate
+    #[inline]
+
     fn update_phase_increment(&mut self) {
         self.phase_increment = 2.0 * PI * self.rate / self.sample_rate as f32;
     }

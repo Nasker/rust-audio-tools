@@ -79,6 +79,8 @@ impl ModSource {
     }
 
     /// Whether the engine currently feeds a live value for this source.
+    #[inline]
+
     pub fn is_wired(&self) -> bool {
         !matches!(self, ModSource::Off)
     }
@@ -238,18 +240,24 @@ impl ModDest {
     /// Whether the DSP currently applies this destination. Global effect
     /// destinations are evaluated at VoiceManager level and applied to the
     /// effects chain each sample.
+    #[inline]
+
     pub fn is_wired(&self) -> bool {
         !matches!(self, ModDest::Off)
     }
 
     /// Whether this destination feeds the global effects chain rather than
     /// the per-voice or LFO paths.
+    #[inline]
+
     pub fn is_global_fx(&self) -> bool {
         FX_MOD_MASK & (1u64 << *self as u64) != 0
     }
 
     /// Whether this destination is evaluated per-voice (as opposed to global
     /// engine-level destinations such as effect parameters).
+    #[inline]
+
     pub fn is_per_voice(&self) -> bool {
         matches!(
             self,
@@ -285,6 +293,8 @@ impl ModDest {
 /// Pitch-type destinations are in semitones; cutoff is in semitones applied
 /// multiplicatively (`cutoff * 2^(semi/12)`); the rest are normalized units
 /// the caller interprets.
+#[inline]
+
 pub fn dest_range(dest: ModDest) -> f32 {
     match dest {
         ModDest::Off => 0.0,
@@ -387,6 +397,8 @@ impl Default for ModMatrix {
 
 impl ModMatrix {
     /// True when no slot is enabled.
+    #[inline]
+
     pub fn is_empty(&self) -> bool {
         self.slots.iter().all(|s| !s.enabled)
     }
@@ -412,6 +424,8 @@ impl ModMatrix {
     /// NOT multiplied in — the caller uses it to drive a process that
     /// applies the source signal itself (e.g. Osc4 ring modulation, where
     /// the carrier is multiplied by the raw modulator sample).
+    #[inline]
+
     pub fn source_amount(&self, dest: ModDest, src: ModSource) -> f32 {
         let mut acc = 0.0;
         for slot in &self.slots {
@@ -442,6 +456,8 @@ pub struct ModSourceValues {
 }
 
 impl ModSourceValues {
+    #[inline]
+
     pub fn get(&self, source: ModSource) -> f32 {
         match source {
             ModSource::Off => 0.0,
