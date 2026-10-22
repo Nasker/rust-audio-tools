@@ -41,7 +41,7 @@ use std::f32::consts::PI;
 
 /// Samples between control-rate updates (LFO tick, mod matrix, filter coeffs).
 const CONTROL_DIV: u32 = 64;
-const MAX_OSCS: usize = 3;
+const MAX_OSCS: usize = 4;
 
 /// PolyBLEP residual for a discontinuity at phase 0 (normalized t ∈ [0,1)).
 /// For pulse waves call again with the second edge's phase.
@@ -264,6 +264,10 @@ pub struct LeanVoice {
     last_amp: f32,
     fenv_amp: f32,
     env3_amp: f32,
+    /// Audio-rate FM amount from Osc4 -> Osc1/AllPitch
+    osc4_fm: f32,
+    /// Audio-rate Ring-Mod amount from Osc4 -> Osc1Level/Amplitude
+    osc4_rm: f32,
     sample_rate: SampleRate,
 }
 
@@ -275,13 +279,14 @@ impl LeanVoice {
                 LeanOsc::new(WaveformType::Saw),
                 LeanOsc::new(WaveformType::Saw),
                 LeanOsc::new(WaveformType::Square),
+                LeanOsc::new(WaveformType::Sine),
             ],
             gains: [(0.0, 0.0); MAX_OSCS],
             osc_level: [0.0; MAX_OSCS],
             osc_pan: [0.0; MAX_OSCS],
             osc_pw: [0.5; MAX_OSCS],
-            osc_semi: [0, 0, -12],
-            osc_cents: [0, 7, 0],
+            osc_semi: [0, 0, -12, 0],
+            osc_cents: [0, 7, 0, 0],
             detune: [1.0; MAX_OSCS],
             amp_env: ADSREnvelope::new(0.01, 0.1, 0.7, 0.2, sample_rate),
             fenv: ADSREnvelope::new(0.01, 0.3, 0.0, 0.3, sample_rate),
@@ -303,12 +308,14 @@ impl LeanVoice {
             velocity: 0.0,
             note: 0,
             active: false,
-            age: 0,
+            age: u64::MAX,
             control_phase: 0,
             amp_lfo: 1.0,
             last_amp: 0.0,
             fenv_amp: 0.0,
             env3_amp: 0.0,
+            osc4_fm: 0.0,
+            osc4_rm: 0.0,
             sample_rate,
         }
     }
@@ -560,11 +567,40 @@ impl LeanVoice {
 
         let mut l = 0.0f32;
         let mut r = 0.0f32;
-        for i in 0..MAX_OSCS {
+        // Advance Osc 4 first when active (either audible or routed as an
+        // audio-rate FM / Ring-Mod source in the mod matrix).
+        let s4 = if self.gains[3].0 > 0.0
+            || self.gains[3].1 > 0.0
+            || self.osc4_fm != 0.0
+            || self.osc4_rm != 0.0
+        {
+            let v = self.oscs[3].next();
+            l += v * self.gains[3].0;
+            r += v * self.gains[3].1;
+            if self.osc4_fm != 0.0 {
+                let mut p = self.oscs[0].phase + v * self.osc4_fm * self.oscs[0].inc * 4.0;
+                if p >= 1.0 {
+                    p -= 1.0;
+                } else if p < 0.0 {
+                    p += 1.0;
+                }
+                self.oscs[0].phase = p;
+            }
+            v
+        } else {
+            0.0
+        };
+        let rm_gain = if self.osc4_rm != 0.0 {
+            1.0 + s4 * self.osc4_rm
+        } else {
+            1.0
+        };
+        for i in 0..3 {
             if self.gains[i].0 > 0.0 || self.gains[i].1 > 0.0 {
                 let s = self.oscs[i].next();
-                l += s * self.gains[i].0;
-                r += s * self.gains[i].1;
+                let m = if i == 0 { rm_gain } else { 1.0 };
+                l += s * self.gains[i].0 * m;
+                r += s * self.gains[i].1 * m;
             }
         }
 
@@ -618,14 +654,30 @@ impl EmbeddedEngine {
 
     fn repack_mod_slots(&mut self) {
         let mut n = 0;
+        let mut fm = 0.0f32;
+        let mut rm = 0.0f32;
         for slot in &self.mod_matrix.slots {
             if slot.enabled && slot.source != ModSource::Off && slot.dest != ModDest::Off && slot.amount != 0.0 {
-                self.active_slots[n] = *slot;
-                n += 1;
+                if slot.source == ModSource::Osc4 {
+                    match slot.dest {
+                        ModDest::AllPitch | ModDest::Osc1Pitch | ModDest::Osc2Pitch => {
+                            fm += slot.amount;
+                        }
+                        ModDest::Osc1Level | ModDest::Osc2Level | ModDest::Amplitude => {
+                            rm += slot.amount;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    self.active_slots[n] = *slot;
+                    n += 1;
+                }
             }
         }
         self.num_active_slots = n;
         for v in &mut self.voices {
+            v.osc4_fm = fm;
+            v.osc4_rm = rm;
             v.update_gains();
             for i in 0..MAX_OSCS {
                 v.oscs[i].set_duty(v.osc_pw[i]);
@@ -726,15 +778,33 @@ impl EmbeddedEngine {
             v.oscs[1].set_duty(preset.osc2_pw);
             v.oscs[2].kind = preset.osc3_waveform;
             v.oscs[2].set_duty(preset.osc3_pw);
-            v.osc_pw = [preset.osc1_pw, preset.osc2_pw, preset.osc3_pw];
-            v.osc_level = [preset.osc1_level, preset.osc2_level, preset.osc3_level];
-            v.osc_pan = [preset.osc1_pan, preset.osc2_pan, preset.osc3_pan];
-            v.osc_semi = [0, preset.osc2_semitones, preset.osc3_semitones];
-            v.osc_cents = [0, preset.osc2_cents, preset.osc3_cents];
+            v.oscs[3].kind = preset.osc4_waveform;
+            v.oscs[3].set_duty(preset.osc4_pw);
+            v.osc_pw = [preset.osc1_pw, preset.osc2_pw, preset.osc3_pw, preset.osc4_pw];
+            v.osc_level = [
+                preset.osc1_level,
+                preset.osc2_level,
+                preset.osc3_level,
+                preset.osc4_level,
+            ];
+            v.osc_pan = [
+                preset.osc1_pan,
+                preset.osc2_pan,
+                preset.osc3_pan,
+                preset.osc4_pan,
+            ];
+            v.osc_semi = [
+                0,
+                preset.osc2_semitones,
+                preset.osc3_semitones,
+                preset.osc4_semitones,
+            ];
+            v.osc_cents = [0, preset.osc2_cents, preset.osc3_cents, preset.osc4_cents];
             v.detune = [
                 1.0,
                 super::oscillator::detune_ratio(preset.osc2_semitones, preset.osc2_cents),
                 super::oscillator::detune_ratio(preset.osc3_semitones, preset.osc3_cents),
+                super::oscillator::detune_ratio(preset.osc4_semitones, preset.osc4_cents),
             ];
             v.update_gains();
             // Update ADSR parameters in place so active voices keep sounding
@@ -990,6 +1060,45 @@ impl EmbeddedEngine {
             SynthParam::Osc3Pan => {
                 for v in &mut self.voices {
                     v.osc_pan[2] = plain.clamp(-1.0, 1.0);
+                    v.update_gains();
+                }
+            }
+            SynthParam::Osc4Waveform => {
+                let wf = WaveformType::from_index(plain as u8);
+                for v in &mut self.voices {
+                    v.oscs[3].kind = wf;
+                }
+            }
+            SynthParam::Osc4Level => {
+                let lvl = plain.clamp(0.0, 1.0);
+                for v in &mut self.voices {
+                    v.osc_level[3] = lvl;
+                    v.update_gains();
+                }
+            }
+            SynthParam::Osc4Semitones => {
+                let semi = plain.round() as i8;
+                for v in &mut self.voices {
+                    v.osc_semi[3] = semi;
+                    v.detune[3] = super::oscillator::detune_ratio(v.osc_semi[3], v.osc_cents[3]);
+                }
+            }
+            SynthParam::Osc4Cents => {
+                let cents = plain.round() as i8;
+                for v in &mut self.voices {
+                    v.osc_cents[3] = cents;
+                    v.detune[3] = super::oscillator::detune_ratio(v.osc_semi[3], v.osc_cents[3]);
+                }
+            }
+            SynthParam::Osc4Pw => {
+                for v in &mut self.voices {
+                    v.osc_pw[3] = plain;
+                    v.oscs[3].set_duty(plain);
+                }
+            }
+            SynthParam::Osc4Pan => {
+                for v in &mut self.voices {
+                    v.osc_pan[3] = plain.clamp(-1.0, 1.0);
                     v.update_gains();
                 }
             }
