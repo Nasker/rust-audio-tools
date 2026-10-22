@@ -58,13 +58,6 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
     }
 }
 
-#[inline(always)]
-fn flush_denormal(x: &mut f32) {
-    if x.abs() < 1e-18 {
-        *x = 0.0;
-    }
-}
-
 /// Fixed-pipeline oscillator: one struct, waveform chosen by a match —
 /// statically dispatched and inlinable, unlike `Box<dyn Oscillator>`.
 pub struct LeanOsc {
@@ -153,6 +146,7 @@ struct TptSvf {
     a2: f32,
     a3: f32,
     k: f32,
+    in_gain: f32,
     mode: FilterMode,
     ic1: [f32; 2],
     ic2: [f32; 2],
@@ -165,6 +159,7 @@ impl TptSvf {
             a2: 0.0,
             a3: 0.0,
             k: 2.0,
+            in_gain: 1.0,
             mode: FilterMode::LowPass,
             ic1: [0.0; 2],
             ic2: [0.0; 2],
@@ -182,9 +177,9 @@ impl TptSvf {
         let w = PI * fc / fs as f32;
         let (sw, cw) = w.sin_cos();
         let g = (sw / cw.max(1e-4)).min(10.0);
-        // k = 2/Q: maps reso 0..1 -> k = 2.0..0.06 (Q = 0.5..16.7, strong resonance)
+        // k = 2/Q: maps reso 0..1 -> k = 2.0..0.08 (Q = 0.5..12.5)
         let r = reso.clamp(0.0, 1.0);
-        let k = 2.0 - 1.94 * r;
+        let k = 2.0 - 1.92 * r;
         let a1 = 1.0 / (1.0 + g * (g + k));
         let a2 = g * a1;
         let a3 = g * a2;
@@ -192,30 +187,35 @@ impl TptSvf {
         self.a2 = a2;
         self.a3 = a3;
         self.k = k;
+        // Moderate input headroom compensation at high Q so passband stays
+        // full while high-velocity resonant peaks stay controlled.
+        self.in_gain = 1.0 / (1.0 + 0.35 * r * r);
         self.mode = mode;
     }
 
     #[inline(always)]
     #[link_section = ".iram1.text"]
     fn process(&mut self, ch: usize, x: Sample) -> Sample {
-        let v3 = (x + 1e-19) - self.ic2[ch];
+        let xin = x * self.in_gain;
+        let v3 = (xin + 1e-19) - self.ic2[ch];
         let v1 = self.a1 * self.ic1[ch] + self.a2 * v3;
         let v2 = self.ic2[ch] + self.a2 * self.ic1[ch] + self.a3 * v3;
         let mut ic1 = 2.0 * v1 - self.ic1[ch];
         let ic2 = 2.0 * v2 - self.ic2[ch];
-        // Division-free cubic resonator saturation when driven hard so high Q
-        // sings without running away or stalling on float division.
-        if ic1.abs() > 1.0 {
-            let c = ic1.clamp(-1.8, 1.8);
-            ic1 = c * (1.0 - 0.09 * c * c);
+        // Smooth division-free cubic saturation on the bandpass resonator state
+        // starting at 0.60 (caps peak around ±0.90) so high Q self-oscillates
+        // warmly without harsh clipping on high-velocity strikes.
+        if ic1.abs() > 0.60 {
+            let c = ic1.clamp(-1.35, 1.35);
+            ic1 = c * (1.0 - 0.18 * c * c);
         }
         self.ic1[ch] = ic1;
         self.ic2[ch] = ic2;
         match self.mode {
             FilterMode::LowPass => v2,
             FilterMode::BandPass => v1,
-            FilterMode::HighPass => x - self.k * v1 - v2,
-            FilterMode::Notch => x - self.k * v1,
+            FilterMode::HighPass => xin - self.k * v1 - v2,
+            FilterMode::Notch => xin - self.k * v1,
         }
     }
 }
@@ -308,12 +308,15 @@ impl LeanVoice {
     }
 
     fn note_on(&mut self, note: MidiNote, velocity: Amplitude, portamento: f32, age: u64) {
+        let was_active = self.active && self.amp_env.state() != EnvelopeState::Idle;
         let freq = midi_to_frequency(note);
         self.note = note;
-        self.velocity = velocity;
+        // Gentle velocity curve (concave power) so max-velocity hits stay
+        // punchy without jumping disproportionately in peak level.
+        self.velocity = velocity.clamp(0.0, 1.0).sqrt();
         self.active = true;
         self.age = age;
-        if portamento > 0.005 && self.amp_env.state() != EnvelopeState::Idle {
+        if portamento > 0.005 && was_active {
             // legato glide — start from wherever the last note left us
             self.glide_target = freq;
             self.glide_step = (freq - self.base_freq) / (portamento * self.sample_rate as f32);
@@ -321,16 +324,20 @@ impl LeanVoice {
         } else {
             self.base_freq = freq;
             self.gliding = false;
-            self.filter.reset();
+            if !was_active {
+                self.filter.reset();
+            }
         }
-        self.amp_env.reset();
+        if !was_active {
+            self.amp_env.reset();
+            self.fenv.reset();
+            self.lfo.reset();
+            for o in &mut self.oscs {
+                o.reset();
+            }
+        }
         self.amp_env.trigger();
-        self.fenv.reset();
         self.fenv.trigger();
-        self.lfo.reset();
-        for o in &mut self.oscs {
-            o.reset();
-        }
         self.set_osc_freqs(0.0);
         self.control_phase = 0;
     }
@@ -443,6 +450,7 @@ pub struct EmbeddedEngine {
     polyphony: PolyphonyMode,
     age_counter: u64,
     stereo_width: f32,
+    comp_env: f32,        // stereo bus compressor/limiter envelope follower
 }
 
 impl EmbeddedEngine {
@@ -459,11 +467,22 @@ impl EmbeddedEngine {
             polyphony: PolyphonyMode::Poly,
             age_counter: 0,
             stereo_width: 1.0,
+            comp_env: 0.0,
         }
     }
 
     pub fn set_master_volume(&mut self, v: Amplitude) {
         self.master_volume = v.clamp(0.0, 1.0);
+    }
+
+    pub fn set_filter_mode(&mut self, mode: FilterMode) {
+        for v in &mut self.voices {
+            v.filter_mode = mode;
+        }
+    }
+
+    pub fn set_mod_wheel(&mut self, v: f32) {
+        self.mod_wheel = v.clamp(0.0, 1.0);
     }
 
     pub fn active_voice_count(&self) -> usize {
@@ -763,7 +782,7 @@ impl EmbeddedEngine {
         match event.kind {
             SynthEventKind::NoteOn => {
                 self.age_counter += 1;
-                let idx = self.pick_voice();
+                let idx = self.pick_voice(event.note);
                 self.voices[idx].note_on(
                     event.note,
                     event.velocity,
@@ -805,22 +824,42 @@ impl EmbeddedEngine {
         }
     }
 
-    fn pick_voice(&mut self) -> usize {
+    fn pick_voice(&mut self, note: MidiNote) -> usize {
         if self.polyphony != PolyphonyMode::Poly {
             return 0;
         }
-        // free voice first, else steal the oldest
+        // 1. Retrigger: if a voice is already playing this exact MIDI note
+        //    (whether held or in its release tail), reuse it so hammering notes
+        //    never exhausts the polyphony pool with duplicate tails.
+        if let Some(i) = self.voices.iter().position(|v| v.active && v.note == note) {
+            return i;
+        }
+        // 2. Idle voice: pick the first completely free slot.
+        if let Some(i) = self.voices.iter().position(|v| !v.active) {
+            return i;
+        }
+        // 3. Releasing voice: steal the oldest releasing voice so held notes
+        //    (Attack/Decay/Sustain) are never killed by release tails.
+        if let Some((i, _)) = self
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.amp_env.state() == EnvelopeState::Release)
+            .min_by_key(|(_, v)| v.age)
+        {
+            return i;
+        }
+        // 4. All voices are physically held: protect the lowest held bass note
+        //    and steal the oldest among the remaining held voices.
+        let lowest_note = self.voices.iter().map(|v| v.note).min().unwrap_or(0);
         self.voices
             .iter()
-            .position(|v| !v.active)
-            .unwrap_or_else(|| {
-                self.voices
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, v)| v.age)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            })
+            .enumerate()
+            .filter(|(_, v)| v.note != lowest_note)
+            .min_by_key(|(_, v)| v.age)
+            .or_else(|| self.voices.iter().enumerate().min_by_key(|(_, v)| v.age))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     #[link_section = ".iram1.text"]
@@ -841,6 +880,24 @@ impl EmbeddedEngine {
             out = out.with_width(self.stereo_width);
         }
         out = self.effects.process_stereo(out) * self.master_volume;
+
+        // Stereo bus peak compressor/limiter: fast (~1.5 ms) attack, smooth
+        // (~120 ms) release above 0.60 threshold so resonant or multi-voice
+        // peaks are leveled cleanly without waveshaper buzz.
+        let peak = out.left.abs().max(out.right.abs());
+        let coeff = if peak > self.comp_env { 0.015 } else { 0.0002 };
+        self.comp_env += coeff * (peak - self.comp_env);
+        if self.comp_env < 1e-18 {
+            self.comp_env = 0.0;
+        }
+        if self.comp_env > 0.60 {
+            let excess = self.comp_env - 0.60;
+            let target = 0.60 + 0.32 * (excess / (0.32 + excess));
+            let gain = target / self.comp_env;
+            out.left *= gain;
+            out.right *= gain;
+        }
+
         StereoSample::new(soft_clip(out.left), soft_clip(out.right))
     }
 }
@@ -943,5 +1000,36 @@ mod tests {
             peak = peak.max(s.left.abs()).max(s.right.abs());
         }
         assert!(peak > 0.1 && peak <= 1.0, "unexpected peak={peak}");
+    }
+
+    #[test]
+    fn held_bass_note_survives_repeated_chord_strums() {
+        let mut e = engine();
+        // Hold low C2 (MIDI 36)
+        e.receive_event(NoteEvent::note_on_midi(36, 110));
+        for _ in 0..4410 {
+            e.next_sample_stereo();
+        }
+        // Repeatedly strum 6 different upper notes (releasing between strums)
+        for round in 0..12 {
+            let chord = [60u8, 64, 67, 71, 74, 76];
+            for &n in &chord {
+                e.receive_event(NoteEvent::note_on_midi(n, 120));
+                for _ in 0..128 {
+                    e.next_sample_stereo();
+                }
+            }
+            for &n in &chord {
+                e.receive_event(NoteEvent::note_off(n));
+            }
+            for _ in 0..512 {
+                e.next_sample_stereo();
+            }
+            let bass_alive = e
+                .voices
+                .iter()
+                .any(|v| v.active && v.note == 36 && v.amp_env.state() != EnvelopeState::Release);
+            assert!(bass_alive, "held bass note 36 was killed at round {round}");
+        }
     }
 }
