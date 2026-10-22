@@ -331,8 +331,8 @@ impl LeanVoice {
 
     /// One control tick: LFO → resolved pitch/cutoff/amp targets.
     #[inline]
-    fn control_tick(&mut self, bend_semitones: f32) {
-        let lfo = self.lfo.next_value(); // already depth-scaled, -depth..depth
+    fn control_tick(&mut self, bend_semitones: f32, cc: &CcMods) {
+        let lfo = self.lfo.next_value() * cc.lfo_gain; // depth-scaled, ×mod wheel
         let lfo_pitch = if self.lfo_dest == LfoDestination::Pitch {
             lfo * 2.0 // ±2 semitones at full depth
         } else {
@@ -347,10 +347,10 @@ impl LeanVoice {
         };
         // Filter env: 6-octave sweep at full amount (matches the rich engine)
         let env_sweep = 6.0 * self.fenv_amount * self.fenv_amp;
-        let cutoff = (self.base_cutoff * 2.0f32.powf(env_sweep + lfo_cutoff))
+        let cutoff = (self.base_cutoff * 2.0f32.powf(env_sweep + lfo_cutoff + cc.cutoff_oct))
             .clamp(20.0, self.sample_rate as f32 * 0.45);
         self.filter
-            .set(self.filter_mode, cutoff, self.res_q, self.sample_rate);
+            .set(self.filter_mode, cutoff, self.res_q * cc.res_mul, self.sample_rate);
 
         self.amp_lfo = if self.lfo_dest == LfoDestination::Amplitude {
             1.0 + lfo * 0.5
@@ -360,7 +360,7 @@ impl LeanVoice {
     }
 
     #[link_section = ".iram1.text"]
-    fn next_stereo(&mut self, bend_semitones: f32) -> StereoSample {
+    fn next_stereo(&mut self, bend_semitones: f32, cc: &CcMods) -> StereoSample {
         if !self.active {
             return StereoSample::ZERO;
         }
@@ -384,7 +384,7 @@ impl LeanVoice {
         }
 
         if self.control_phase == 0 {
-            self.control_tick(bend_semitones);
+            self.control_tick(bend_semitones, cc);
         }
         self.control_phase = (self.control_phase + 1) % CONTROL_DIV;
 
@@ -405,6 +405,31 @@ impl LeanVoice {
     }
 }
 
+/// Live CC modifiers applied on top of preset values. Set by
+/// `ControlChange` events; defaults are neutral until a controller moves.
+#[derive(Clone, Copy)]
+pub struct CcMods {
+    /// Cutoff offset in octaves (CC74 "brightness", bipolar ±3)
+    pub cutoff_oct: f32,
+    /// Resonance Q multiplier (CC71), 0.5x..2.5x
+    pub res_mul: f32,
+    /// LFO depth gain (CC1 mod wheel), 1x..4x
+    pub lfo_gain: f32,
+    /// Volume multiplier (CC7), 0..1
+    pub volume: f32,
+}
+
+impl Default for CcMods {
+    fn default() -> Self {
+        Self {
+            cutoff_oct: 0.0,
+            res_mul: 1.0,
+            lfo_gain: 1.0,
+            volume: 1.0,
+        }
+    }
+}
+
 pub struct EmbeddedEngine {
     voices: Vec<LeanVoice>,
     sample_rate: SampleRate,
@@ -415,6 +440,7 @@ pub struct EmbeddedEngine {
     polyphony: PolyphonyMode,
     age_counter: u64,
     stereo_width: f32,
+    cc: CcMods,
 }
 
 impl EmbeddedEngine {
@@ -429,6 +455,7 @@ impl EmbeddedEngine {
             polyphony: PolyphonyMode::Poly,
             age_counter: 0,
             stereo_width: 1.0,
+            cc: CcMods::default(),
         }
     }
 
@@ -459,9 +486,11 @@ impl EmbeddedEngine {
             ];
             let (p0l, p0r) = pan_gains(preset.osc1_pan);
             let (p1l, p1r) = pan_gains(preset.osc2_pan);
+            // Match OscillatorBank's /4.0 per-oscillator gain staging so
+            // multi-osc + polyphonic voice sums stay in the linear region.
             v.gains = [
-                (preset.osc1_level * p0l, preset.osc1_level * p0r),
-                (preset.osc2_level * p1l, preset.osc2_level * p1r),
+                (preset.osc1_level * 0.25 * p0l, preset.osc1_level * 0.25 * p0r),
+                (preset.osc2_level * 0.25 * p1l, preset.osc2_level * 0.25 * p1r),
             ];
             v.amp_env = ADSREnvelope::new(
                 preset.amp_attack,
@@ -505,6 +534,16 @@ impl EmbeddedEngine {
                 }
             }
             SynthEventKind::PitchBend(v) => self.pitch_bend = v,
+            SynthEventKind::ControlChange { cc, value } => {
+                let v = value as f32 / 127.0;
+                match cc {
+                    1 => self.cc.lfo_gain = 1.0 + v * 3.0,
+                    7 => self.cc.volume = v,
+                    71 => self.cc.res_mul = 0.5 + v * 2.0,
+                    74 => self.cc.cutoff_oct = v * 6.0 - 3.0,
+                    _ => {}
+                }
+            }
             _ => {}
         }
     }
@@ -532,14 +571,15 @@ impl EmbeddedEngine {
         let bend_semi = self.pitch_bend * self.bend_range;
         let mut l = 0.0f32;
         let mut r = 0.0f32;
+        let cc = self.cc;
         for v in &mut self.voices {
             if v.active {
-                let s = v.next_stereo(bend_semi);
+                let s = v.next_stereo(bend_semi, &cc);
                 l += s.left;
                 r += s.right;
             }
         }
-        let mut out = StereoSample::new(l, r) * self.master_volume;
+        let mut out = StereoSample::new(l, r) * self.master_volume * self.cc.volume;
         if self.stereo_width != 1.0 {
             out = out.with_width(self.stereo_width);
         }
@@ -549,11 +589,12 @@ impl EmbeddedEngine {
 
 #[inline]
 fn soft_clip(x: f32) -> f32 {
-    if x.abs() <= 1.0 {
+    if x.abs() <= 0.75 {
         x
     } else {
-        let t = (x.abs() - 1.0).min(2.0);
-        x.signum() * (1.0 + t - t * t * 0.25)
+        // Smoothly compress above 0.75 into [-1.0, 1.0] (never exceeds ±1).
+        let excess = x.abs() - 0.75;
+        x.signum() * (0.75 + 0.25 * (excess / (0.25 + excess)))
     }
 }
 
