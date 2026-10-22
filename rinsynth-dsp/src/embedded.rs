@@ -720,7 +720,6 @@ impl EmbeddedEngine {
         }
 
         for v in &mut self.voices {
-            let ctrl_sr = (v.sample_rate / CONTROL_DIV).max(1);
             v.oscs[0].kind = preset.osc1_waveform;
             v.oscs[0].set_duty(preset.osc1_pw);
             v.oscs[1].kind = preset.osc2_waveform;
@@ -738,27 +737,20 @@ impl EmbeddedEngine {
                 super::oscillator::detune_ratio(preset.osc3_semitones, preset.osc3_cents),
             ];
             v.update_gains();
-            v.amp_env = ADSREnvelope::new(
-                preset.amp_attack,
-                preset.amp_decay,
-                preset.amp_sustain,
-                preset.amp_release,
-                v.sample_rate,
-            );
-            v.fenv = ADSREnvelope::new(
-                preset.filter_attack,
-                preset.filter_decay,
-                preset.filter_sustain,
-                preset.filter_release,
-                v.sample_rate,
-            );
-            v.env3 = ADSREnvelope::new(
-                preset.env3_attack,
-                preset.env3_decay,
-                preset.env3_sustain,
-                preset.env3_release,
-                ctrl_sr,
-            );
+            // Update ADSR parameters in place so active voices keep sounding
+            // through preset changes instead of dropping to Idle.
+            v.amp_env.set_attack(preset.amp_attack);
+            v.amp_env.set_decay(preset.amp_decay);
+            v.amp_env.set_sustain(preset.amp_sustain);
+            v.amp_env.set_release(preset.amp_release);
+            v.fenv.set_attack(preset.filter_attack);
+            v.fenv.set_decay(preset.filter_decay);
+            v.fenv.set_sustain(preset.filter_sustain);
+            v.fenv.set_release(preset.filter_release);
+            v.env3.set_attack(preset.env3_attack);
+            v.env3.set_decay(preset.env3_decay);
+            v.env3.set_sustain(preset.env3_sustain);
+            v.env3.set_release(preset.env3_release);
             v.fenv_amount = preset.filter_env_amount;
             v.base_cutoff = preset.filter_cutoff;
             v.resonance = reso;
