@@ -23,11 +23,15 @@
 //!
 //! Target: ~700 cycles/voice-sample → 8 voices inside a 5.8 ms block.
 
+use super::effects::{DistortionType, EffectsChain};
 use super::envelope::{ADSREnvelope, Envelope, EnvelopeState};
 use super::filter::FilterMode;
 use super::oscillator::sine_lut;
 use rinsynth_model::event::{NoteEvent, SynthEventKind, WaveformType};
-use rinsynth_model::lfo::{LfoDestination, LFO};
+use rinsynth_model::lfo::{LfoDestination, LfoWaveform, LFO};
+use rinsynth_model::mod_matrix::{ModDest, ModSource};
+use rinsynth_model::param_spec::cc_to_plain;
+use rinsynth_model::params::{CCMapping, SynthParam};
 use rinsynth_model::presets::Preset;
 use rinsynth_model::types::{
     midi_to_frequency, Amplitude, Frequency, MidiNote, Sample, SampleRate, StereoSample,
@@ -141,74 +145,78 @@ impl LeanOsc {
     }
 }
 
-/// RBJ cookbook biquad — LP/HP/BP/notch, stereo states sharing one set of
-/// coefficients. ~9 flops/channel vs the saturated SVF's ~50.
-struct Biquad {
-    b0: f32,
-    b1: f32,
-    b2: f32,
+/// Zavalishin topology-preserving transform (TPT) state-variable filter.
+/// Unconditionally stable under fast cutoff/resonance modulation, 4 muls per
+/// channel, and self-oscillates musically with bandpass state saturation.
+struct TptSvf {
     a1: f32,
     a2: f32,
-    x1: [f32; 2],
-    x2: [f32; 2],
-    y1: [f32; 2],
-    y2: [f32; 2],
+    a3: f32,
+    k: f32,
+    mode: FilterMode,
+    ic1: [f32; 2],
+    ic2: [f32; 2],
 }
 
-impl Biquad {
+impl TptSvf {
     fn new() -> Self {
         Self {
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
             a1: 0.0,
             a2: 0.0,
-            x1: [0.0; 2],
-            x2: [0.0; 2],
-            y1: [0.0; 2],
-            y2: [0.0; 2],
+            a3: 0.0,
+            k: 2.0,
+            mode: FilterMode::LowPass,
+            ic1: [0.0; 2],
+            ic2: [0.0; 2],
         }
     }
 
-    /// Recompute coefficients — control rate only (sin/cos + a division).
-    fn set(&mut self, mode: FilterMode, cutoff: Frequency, q: f32, fs: SampleRate) {
-        let fc = cutoff.clamp(20.0, fs as f32 * 0.45);
-        let w = 2.0 * PI * fc / fs as f32;
+    fn reset(&mut self) {
+        self.ic1 = [0.0; 2];
+        self.ic2 = [0.0; 2];
+    }
+
+    /// Recompute coefficients at control rate (`reso` in 0.0..=1.0).
+    fn set(&mut self, mode: FilterMode, cutoff: Frequency, reso: f32, fs: SampleRate) {
+        let fc = cutoff.clamp(25.0, fs as f32 * 0.42);
+        let w = PI * fc / fs as f32;
         let (sw, cw) = w.sin_cos();
-        let alpha = sw / (2.0 * q.max(0.01));
-        let a0 = 1.0 + alpha;
-        let (b0, b1, b2) = match mode {
-            FilterMode::LowPass => {
-                let t = (1.0 - cw) * 0.5;
-                (t, 2.0 * t, t)
-            }
-            FilterMode::HighPass => {
-                let t = (1.0 + cw) * 0.5;
-                (t, -2.0 * t, t)
-            }
-            FilterMode::BandPass => (alpha, 0.0, -alpha),
-            FilterMode::Notch => (1.0, -2.0 * cw, 1.0),
-        };
-        let inv = 1.0 / a0;
-        self.b0 = b0 * inv;
-        self.b1 = b1 * inv;
-        self.b2 = b2 * inv;
-        self.a1 = -2.0 * cw * inv;
-        self.a2 = (1.0 - alpha) * inv;
+        let g = (sw / cw.max(1e-4)).min(10.0);
+        // k = 2/Q: maps reso 0..1 -> k = 2.0..0.06 (Q = 0.5..16.7, strong resonance)
+        let r = reso.clamp(0.0, 1.0);
+        let k = 2.0 - 1.94 * r;
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        let a3 = g * a2;
+        self.a1 = a1;
+        self.a2 = a2;
+        self.a3 = a3;
+        self.k = k;
+        self.mode = mode;
     }
 
     #[inline(always)]
     #[link_section = ".iram1.text"]
     fn process(&mut self, ch: usize, x: Sample) -> Sample {
-        let mut y = self.b0 * x + self.b1 * self.x1[ch] + self.b2 * self.x2[ch]
-            - self.a1 * self.y1[ch]
-            - self.a2 * self.y2[ch];
-        flush_denormal(&mut y);
-        self.x2[ch] = self.x1[ch];
-        self.x1[ch] = x;
-        self.y2[ch] = self.y1[ch];
-        self.y1[ch] = y;
-        y
+        let v3 = (x + 1e-19) - self.ic2[ch];
+        let v1 = self.a1 * self.ic1[ch] + self.a2 * v3;
+        let v2 = self.ic2[ch] + self.a2 * self.ic1[ch] + self.a3 * v3;
+        let mut ic1 = 2.0 * v1 - self.ic1[ch];
+        let ic2 = 2.0 * v2 - self.ic2[ch];
+        // Division-free cubic resonator saturation when driven hard so high Q
+        // sings without running away or stalling on float division.
+        if ic1.abs() > 1.0 {
+            let c = ic1.clamp(-1.8, 1.8);
+            ic1 = c * (1.0 - 0.09 * c * c);
+        }
+        self.ic1[ch] = ic1;
+        self.ic2[ch] = ic2;
+        match self.mode {
+            FilterMode::LowPass => v2,
+            FilterMode::BandPass => v1,
+            FilterMode::HighPass => x - self.k * v1 - v2,
+            FilterMode::Notch => x - self.k * v1,
+        }
     }
 }
 
@@ -222,19 +230,22 @@ fn pan_gains(pan: f32) -> (f32, f32) {
 
 pub struct LeanVoice {
     oscs: [LeanOsc; MAX_OSCS],
-    /// (level × panL, level × panR) per osc — level folded into pan so the
-    /// per-sample path is just two muls.
+    /// (level × 0.25 × panL, level × 0.25 × panR) per osc
     gains: [(f32, f32); MAX_OSCS],
     osc_level: [f32; MAX_OSCS],
+    osc_pan: [f32; MAX_OSCS],
+    osc2_semi: i8,
+    osc2_cents: i8,
     detune: [f32; MAX_OSCS],
     amp_env: ADSREnvelope,
     fenv: ADSREnvelope,
     fenv_amount: f32,
-    filter: Biquad,
+    filter: TptSvf,
     filter_mode: FilterMode,
-    res_q: f32,
+    resonance: f32, // 0.0..1.0
     base_cutoff: Frequency,
     lfo: LFO,
+    lfo_depth: f32,
     lfo_dest: LfoDestination,
     base_freq: Frequency,
     glide_step: f32,
@@ -259,15 +270,19 @@ impl LeanVoice {
             ],
             gains: [(0.0, 0.0); MAX_OSCS],
             osc_level: [0.0; MAX_OSCS],
+            osc_pan: [0.0; MAX_OSCS],
+            osc2_semi: 0,
+            osc2_cents: 0,
             detune: [1.0; MAX_OSCS],
             amp_env: ADSREnvelope::new(0.01, 0.1, 0.7, 0.2, sample_rate),
             fenv: ADSREnvelope::new(0.01, 0.3, 0.0, 0.3, sample_rate),
             fenv_amount: 0.0,
-            filter: Biquad::new(),
+            filter: TptSvf::new(),
             filter_mode: FilterMode::LowPass,
-            res_q: 0.707,
+            resonance: 0.2,
             base_cutoff: 8000.0,
             lfo: LFO::new((sample_rate / CONTROL_DIV).max(1)),
+            lfo_depth: 0.0,
             lfo_dest: LfoDestination::Off,
             base_freq: 440.0,
             glide_step: 0.0,
@@ -281,6 +296,14 @@ impl LeanVoice {
             amp_lfo: 1.0,
             fenv_amp: 0.0,
             sample_rate,
+        }
+    }
+
+    fn update_gains(&mut self) {
+        for i in 0..MAX_OSCS {
+            let (pl, pr) = pan_gains(self.osc_pan[i]);
+            let lvl = self.osc_level[i] * 0.25;
+            self.gains[i] = (lvl * pl, lvl * pr);
         }
     }
 
@@ -298,6 +321,7 @@ impl LeanVoice {
         } else {
             self.base_freq = freq;
             self.gliding = false;
+            self.filter.reset();
         }
         self.amp_env.reset();
         self.amp_env.trigger();
@@ -331,8 +355,10 @@ impl LeanVoice {
 
     /// One control tick: LFO → resolved pitch/cutoff/amp targets.
     #[inline]
-    fn control_tick(&mut self, bend_semitones: f32, cc: &CcMods) {
-        let lfo = self.lfo.next_value() * cc.lfo_gain; // depth-scaled, ×mod wheel
+    fn control_tick(&mut self, bend_semitones: f32, mod_wheel: f32) {
+        let eff_depth = (self.lfo_depth + mod_wheel * 0.6).clamp(0.0, 1.0);
+        self.lfo.set_depth(eff_depth);
+        let lfo = self.lfo.next_value(); // -eff_depth..eff_depth
         let lfo_pitch = if self.lfo_dest == LfoDestination::Pitch {
             lfo * 2.0 // ±2 semitones at full depth
         } else {
@@ -341,16 +367,16 @@ impl LeanVoice {
         self.set_osc_freqs(bend_semitones + lfo_pitch);
 
         let lfo_cutoff = if self.lfo_dest == LfoDestination::FilterCutoff {
-            lfo * 2.0 // ±2 octaves at full depth
+            lfo * 2.5 // ±2.5 octaves at full depth
         } else {
             0.0
         };
         // Filter env: 6-octave sweep at full amount (matches the rich engine)
         let env_sweep = 6.0 * self.fenv_amount * self.fenv_amp;
-        let cutoff = (self.base_cutoff * 2.0f32.powf(env_sweep + lfo_cutoff + cc.cutoff_oct))
-            .clamp(20.0, self.sample_rate as f32 * 0.45);
+        let cutoff = (self.base_cutoff * 2.0f32.powf(env_sweep + lfo_cutoff))
+            .clamp(25.0, self.sample_rate as f32 * 0.42);
         self.filter
-            .set(self.filter_mode, cutoff, self.res_q * cc.res_mul, self.sample_rate);
+            .set(self.filter_mode, cutoff, self.resonance, self.sample_rate);
 
         self.amp_lfo = if self.lfo_dest == LfoDestination::Amplitude {
             1.0 + lfo * 0.5
@@ -360,7 +386,7 @@ impl LeanVoice {
     }
 
     #[link_section = ".iram1.text"]
-    fn next_stereo(&mut self, bend_semitones: f32, cc: &CcMods) -> StereoSample {
+    fn next_stereo(&mut self, bend_semitones: f32, mod_wheel: f32) -> StereoSample {
         if !self.active {
             return StereoSample::ZERO;
         }
@@ -384,7 +410,7 @@ impl LeanVoice {
         }
 
         if self.control_phase == 0 {
-            self.control_tick(bend_semitones, cc);
+            self.control_tick(bend_semitones, mod_wheel);
         }
         self.control_phase = (self.control_phase + 1) % CONTROL_DIV;
 
@@ -405,57 +431,34 @@ impl LeanVoice {
     }
 }
 
-/// Live CC modifiers applied on top of preset values. Set by
-/// `ControlChange` events; defaults are neutral until a controller moves.
-#[derive(Clone, Copy)]
-pub struct CcMods {
-    /// Cutoff offset in octaves (CC74 "brightness", bipolar ±3)
-    pub cutoff_oct: f32,
-    /// Resonance Q multiplier (CC71), 0.5x..2.5x
-    pub res_mul: f32,
-    /// LFO depth gain (CC1 mod wheel), 1x..4x
-    pub lfo_gain: f32,
-    /// Volume multiplier (CC7), 0..1
-    pub volume: f32,
-}
-
-impl Default for CcMods {
-    fn default() -> Self {
-        Self {
-            cutoff_oct: 0.0,
-            res_mul: 1.0,
-            lfo_gain: 1.0,
-            volume: 1.0,
-        }
-    }
-}
-
 pub struct EmbeddedEngine {
     voices: Vec<LeanVoice>,
-    sample_rate: SampleRate,
+    pub effects: EffectsChain,
+    cc_mapping: CCMapping,
     master_volume: f32,
+    mod_wheel: f32,       // 0..1 from CC1
     pitch_bend: f32,      // -1..1
     bend_range: f32,      // semitones
     portamento: f32,
     polyphony: PolyphonyMode,
     age_counter: u64,
     stereo_width: f32,
-    cc: CcMods,
 }
 
 impl EmbeddedEngine {
     pub fn new(max_voices: usize, sample_rate: SampleRate) -> Self {
         Self {
             voices: (0..max_voices).map(|_| LeanVoice::new(sample_rate)).collect(),
-            sample_rate,
-            master_volume: 1.0,
+            effects: EffectsChain::new(sample_rate),
+            cc_mapping: CCMapping::default_mappings(),
+            master_volume: 0.7,
+            mod_wheel: 0.0,
             pitch_bend: 0.0,
             bend_range: 12.0,
             portamento: 0.0,
             polyphony: PolyphonyMode::Poly,
             age_counter: 0,
             stereo_width: 1.0,
-            cc: CcMods::default(),
         }
     }
 
@@ -473,25 +476,66 @@ impl EmbeddedEngine {
         self.bend_range = preset.pitch_bend_range as f32;
         self.stereo_width = preset.stereo_width;
         self.master_volume = preset.master_volume.clamp(0.0, 1.0);
-        let res_q = 0.7 * 20.0f32.powf(preset.filter_resonance.clamp(0.0, 1.0));
+        let reso = preset.filter_resonance.clamp(0.0, 1.0);
+
+        // Fold primary mod-matrix routes into the concrete voice slots at
+        // preset-load time (zero per-sample matrix cost).
+        let mut fenv_amount = preset.filter_env_amount;
+        let mut lfo_dest = preset.lfo_destination;
+        let mut lfo_depth = preset.lfo_depth;
+        for slot in &preset.mod_matrix.slots {
+            if !slot.enabled {
+                continue;
+            }
+            if slot.source == ModSource::FilterEnv
+                && slot.dest == ModDest::FilterCutoff
+                && fenv_amount == 0.0
+            {
+                fenv_amount = slot.amount;
+            } else if slot.source == ModSource::Lfo1 && lfo_dest == LfoDestination::Off {
+                match slot.dest {
+                    ModDest::FilterCutoff => {
+                        lfo_dest = LfoDestination::FilterCutoff;
+                        if lfo_depth == 0.0 {
+                            lfo_depth = slot.amount.abs().clamp(0.0, 1.0);
+                        }
+                    }
+                    ModDest::AllPitch | ModDest::Osc1Pitch | ModDest::Osc2Pitch => {
+                        lfo_dest = LfoDestination::Pitch;
+                        if lfo_depth == 0.0 {
+                            lfo_depth = slot.amount.abs().clamp(0.0, 1.0);
+                        }
+                    }
+                    ModDest::Amplitude => {
+                        lfo_dest = LfoDestination::Amplitude;
+                        if lfo_depth == 0.0 {
+                            lfo_depth = slot.amount.abs().clamp(0.0, 1.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // If no LFO destination is set at all, route LFO -> FilterCutoff at 0
+        // base depth so the mod wheel (CC1) always has an audible target.
+        if lfo_dest == LfoDestination::Off && lfo_depth == 0.0 {
+            lfo_dest = LfoDestination::FilterCutoff;
+        }
+
         for v in &mut self.voices {
             v.oscs[0].kind = preset.osc1_waveform;
             v.oscs[0].set_duty(preset.osc1_pw);
             v.oscs[1].kind = preset.osc2_waveform;
             v.oscs[1].set_duty(preset.osc2_pw);
             v.osc_level = [preset.osc1_level, preset.osc2_level];
+            v.osc_pan = [preset.osc1_pan, preset.osc2_pan];
+            v.osc2_semi = preset.osc2_semitones;
+            v.osc2_cents = preset.osc2_cents;
             v.detune = [
                 1.0,
                 super::oscillator::detune_ratio(preset.osc2_semitones, preset.osc2_cents),
             ];
-            let (p0l, p0r) = pan_gains(preset.osc1_pan);
-            let (p1l, p1r) = pan_gains(preset.osc2_pan);
-            // Match OscillatorBank's /4.0 per-oscillator gain staging so
-            // multi-osc + polyphonic voice sums stay in the linear region.
-            v.gains = [
-                (preset.osc1_level * 0.25 * p0l, preset.osc1_level * 0.25 * p0r),
-                (preset.osc2_level * 0.25 * p1l, preset.osc2_level * 0.25 * p1r),
-            ];
+            v.update_gains();
             v.amp_env = ADSREnvelope::new(
                 preset.amp_attack,
                 preset.amp_decay,
@@ -506,13 +550,212 @@ impl EmbeddedEngine {
                 preset.filter_release,
                 v.sample_rate,
             );
-            v.fenv_amount = preset.filter_env_amount;
+            v.fenv_amount = fenv_amount;
             v.base_cutoff = preset.filter_cutoff;
-            v.res_q = res_q;
+            v.resonance = reso;
             v.lfo.set_rate(preset.lfo_rate);
-            v.lfo.set_depth(preset.lfo_depth);
+            v.lfo_depth = lfo_depth;
+            v.lfo.set_depth(lfo_depth);
             v.lfo.set_waveform(preset.lfo_waveform);
-            v.lfo_dest = preset.lfo_destination;
+            v.lfo_dest = lfo_dest;
+        }
+
+        // Sync effects chain from preset
+        self.effects.set_distortion_enabled(preset.distortion_enabled);
+        self.effects.set_distortion_drive(preset.distortion_drive);
+        self.effects.set_distortion_mix(preset.distortion_mix);
+        self.effects.set_distortion_type(preset.distortion_type);
+
+        self.effects.set_chorus_enabled(preset.chorus_enabled);
+        self.effects.set_chorus_rate(preset.chorus_rate);
+        self.effects.set_chorus_depth(preset.chorus_depth);
+        self.effects.set_chorus_mix(preset.chorus_mix);
+
+        self.effects.set_delay_enabled(preset.delay_enabled);
+        self.effects.set_delay_time(preset.delay_time);
+        self.effects.set_delay_feedback(preset.delay_feedback);
+        self.effects.set_delay_mix(preset.delay_mix);
+        self.effects.set_bpm(preset.tempo_bpm);
+        self.effects
+            .set_delay_tempo_sync(preset.delay_sync, preset.delay_beats);
+
+        self.effects.set_reverb_enabled(preset.reverb_enabled);
+        self.effects.set_reverb_room_size(preset.reverb_room_size);
+        self.effects.set_reverb_damping(preset.reverb_damping);
+        self.effects.set_reverb_mix(preset.reverb_mix);
+    }
+
+    /// Apply a plain-valued `SynthParam` update across all voices and effects.
+    pub fn set_param(&mut self, param: SynthParam, plain: f32) {
+        match param {
+            SynthParam::Attack => {
+                for v in &mut self.voices {
+                    v.amp_env.set_attack(plain);
+                }
+            }
+            SynthParam::Decay => {
+                for v in &mut self.voices {
+                    v.amp_env.set_decay(plain);
+                }
+            }
+            SynthParam::Sustain => {
+                for v in &mut self.voices {
+                    v.amp_env.set_sustain(plain);
+                }
+            }
+            SynthParam::Release => {
+                for v in &mut self.voices {
+                    v.amp_env.set_release(plain);
+                }
+            }
+            SynthParam::FilterCutoff => {
+                for v in &mut self.voices {
+                    v.base_cutoff = plain.clamp(25.0, 20000.0);
+                }
+            }
+            SynthParam::FilterResonance => {
+                let r = plain.clamp(0.0, 1.0);
+                for v in &mut self.voices {
+                    v.resonance = r;
+                }
+            }
+            SynthParam::FilterAttack => {
+                for v in &mut self.voices {
+                    v.fenv.set_attack(plain);
+                }
+            }
+            SynthParam::FilterDecay => {
+                for v in &mut self.voices {
+                    v.fenv.set_decay(plain);
+                }
+            }
+            SynthParam::FilterSustain => {
+                for v in &mut self.voices {
+                    v.fenv.set_sustain(plain);
+                }
+            }
+            SynthParam::FilterRelease => {
+                for v in &mut self.voices {
+                    v.fenv.set_release(plain);
+                }
+            }
+            SynthParam::FilterEnvAmount => {
+                for v in &mut self.voices {
+                    v.fenv_amount = plain.clamp(-1.0, 1.0);
+                }
+            }
+            SynthParam::LfoRate => {
+                for v in &mut self.voices {
+                    v.lfo.set_rate(plain);
+                }
+            }
+            SynthParam::LfoDepth => {
+                for v in &mut self.voices {
+                    v.lfo_depth = plain.clamp(0.0, 1.0);
+                }
+            }
+            SynthParam::LfoWaveform => {
+                let wf = match plain as i32 {
+                    0 => LfoWaveform::Sine,
+                    1 => LfoWaveform::Triangle,
+                    2 => LfoWaveform::Square,
+                    3 => LfoWaveform::Saw,
+                    _ => LfoWaveform::Random,
+                };
+                for v in &mut self.voices {
+                    v.lfo.set_waveform(wf);
+                }
+            }
+            SynthParam::LfoDestination => {
+                let dest = match plain as i32 {
+                    0 => LfoDestination::Off,
+                    1 => LfoDestination::Pitch,
+                    2 => LfoDestination::FilterCutoff,
+                    _ => LfoDestination::Amplitude,
+                };
+                for v in &mut self.voices {
+                    v.lfo_dest = dest;
+                }
+            }
+            SynthParam::PitchBendRange => {
+                self.bend_range = plain.clamp(1.0, 24.0);
+            }
+            SynthParam::PortamentoTime => {
+                self.portamento = plain.max(0.0);
+            }
+            SynthParam::Osc1Waveform => {
+                let wf = WaveformType::from_index(plain as u8);
+                for v in &mut self.voices {
+                    v.oscs[0].kind = wf;
+                }
+            }
+            SynthParam::Osc1Level => {
+                let lvl = plain.clamp(0.0, 1.0);
+                for v in &mut self.voices {
+                    v.osc_level[0] = lvl;
+                    v.update_gains();
+                }
+            }
+            SynthParam::Osc1Pw => {
+                for v in &mut self.voices {
+                    v.oscs[0].set_duty(plain);
+                }
+            }
+            SynthParam::Osc1Pan => {
+                for v in &mut self.voices {
+                    v.osc_pan[0] = plain.clamp(-1.0, 1.0);
+                    v.update_gains();
+                }
+            }
+            SynthParam::Osc2Waveform => {
+                let wf = WaveformType::from_index(plain as u8);
+                for v in &mut self.voices {
+                    v.oscs[1].kind = wf;
+                }
+            }
+            SynthParam::Osc2Level => {
+                let lvl = plain.clamp(0.0, 1.0);
+                for v in &mut self.voices {
+                    v.osc_level[1] = lvl;
+                    v.update_gains();
+                }
+            }
+            SynthParam::Osc2Semitones => {
+                let semi = plain.round() as i8;
+                for v in &mut self.voices {
+                    v.osc2_semi = semi;
+                    v.detune[1] = super::oscillator::detune_ratio(v.osc2_semi, v.osc2_cents);
+                }
+            }
+            SynthParam::Osc2Cents => {
+                let cents = plain.round() as i8;
+                for v in &mut self.voices {
+                    v.osc2_cents = cents;
+                    v.detune[1] = super::oscillator::detune_ratio(v.osc2_semi, v.osc2_cents);
+                }
+            }
+            SynthParam::Osc2Pw => {
+                for v in &mut self.voices {
+                    v.oscs[1].set_duty(plain);
+                }
+            }
+            SynthParam::Osc2Pan => {
+                for v in &mut self.voices {
+                    v.osc_pan[1] = plain.clamp(-1.0, 1.0);
+                    v.update_gains();
+                }
+            }
+            SynthParam::StereoWidth => {
+                self.stereo_width = plain.clamp(0.0, 2.0);
+            }
+            SynthParam::MasterVolume => {
+                self.master_volume = plain.clamp(0.0, 1.0);
+            }
+            SynthParam::DistortionType => {
+                self.effects
+                    .set_distortion_type(DistortionType::from_index(plain as u8));
+            }
+            _ => {}
         }
     }
 
@@ -535,13 +778,27 @@ impl EmbeddedEngine {
             }
             SynthEventKind::PitchBend(v) => self.pitch_bend = v,
             SynthEventKind::ControlChange { cc, value } => {
-                let v = value as f32 / 127.0;
+                let norm = value as f32 / 127.0;
                 match cc {
-                    1 => self.cc.lfo_gain = 1.0 + v * 3.0,
-                    7 => self.cc.volume = v,
-                    71 => self.cc.res_mul = 0.5 + v * 2.0,
-                    74 => self.cc.cutoff_oct = v * 6.0 - 3.0,
+                    1 => self.mod_wheel = norm,
+                    7 => self.master_volume = norm,
+                    91 => {
+                        self.effects.set_reverb_enabled(value > 0);
+                        self.effects.set_reverb_mix(norm * 0.6);
+                    }
+                    93 => {
+                        self.effects.set_chorus_enabled(value > 0);
+                        self.effects.set_chorus_mix(norm * 0.6);
+                    }
+                    94 => {
+                        self.effects.set_delay_enabled(value > 0);
+                        self.effects.set_delay_mix(norm * 0.6);
+                    }
                     _ => {}
+                }
+                if let Some(param) = self.cc_mapping.get_param(cc) {
+                    let plain = cc_to_plain(param, value);
+                    self.set_param(param, plain);
                 }
             }
             _ => {}
@@ -569,20 +826,21 @@ impl EmbeddedEngine {
     #[link_section = ".iram1.text"]
     pub fn next_sample_stereo(&mut self) -> StereoSample {
         let bend_semi = self.pitch_bend * self.bend_range;
+        let mod_wheel = self.mod_wheel;
         let mut l = 0.0f32;
         let mut r = 0.0f32;
-        let cc = self.cc;
         for v in &mut self.voices {
             if v.active {
-                let s = v.next_stereo(bend_semi, &cc);
+                let s = v.next_stereo(bend_semi, mod_wheel);
                 l += s.left;
                 r += s.right;
             }
         }
-        let mut out = StereoSample::new(l, r) * self.master_volume * self.cc.volume;
+        let mut out = StereoSample::new(l, r);
         if self.stereo_width != 1.0 {
             out = out.with_width(self.stereo_width);
         }
+        out = self.effects.process_stereo(out) * self.master_volume;
         StereoSample::new(soft_clip(out.left), soft_clip(out.right))
     }
 }
@@ -662,5 +920,28 @@ mod tests {
                 "non-finite output at sample {i}"
             );
         }
+    }
+
+    #[test]
+    fn high_resonance_and_fx_chain_stay_finite_and_audible() {
+        let mut e = engine();
+        // Set cutoff to 800 Hz (CC 74 = 64) and max resonance (CC 71 = 127),
+        // plus enable Chorus (CC 93), Delay (CC 94), and Reverb (CC 91).
+        e.receive_event(NoteEvent::control_change(74, 64));
+        e.receive_event(NoteEvent::control_change(71, 127));
+        e.receive_event(NoteEvent::control_change(91, 60));
+        e.receive_event(NoteEvent::control_change(93, 60));
+        e.receive_event(NoteEvent::control_change(94, 60));
+        e.receive_event(NoteEvent::note_on_midi(48, 120));
+        let mut peak = 0.0f32;
+        for i in 0..8820 {
+            let s = e.next_sample_stereo();
+            assert!(
+                s.left.is_finite() && s.right.is_finite(),
+                "non-finite output at sample {i}"
+            );
+            peak = peak.max(s.left.abs()).max(s.right.abs());
+        }
+        assert!(peak > 0.1 && peak <= 1.0, "unexpected peak={peak}");
     }
 }

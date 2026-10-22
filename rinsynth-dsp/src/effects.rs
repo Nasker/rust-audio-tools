@@ -35,38 +35,43 @@ pub trait StereoEffect: Send {
 // DELAY
 // ============================================================================
 
-/// Simple delay line buffer
+/// Simple power-of-two delay line buffer for branchless bitmask indexing
 struct DelayLine {
     buffer: Vec<Sample>,
+    mask: usize,
     write_pos: usize,
 }
 
 impl DelayLine {
     fn new(max_delay_seconds: f32, sample_rate: SampleRate) -> Self {
-        let size = (max_delay_seconds * sample_rate as f32) as usize + 1;
+        let min_size = (max_delay_seconds * sample_rate as f32) as usize + 2;
+        let size = min_size.next_power_of_two();
         Self {
             buffer: vec![0.0; size],
+            mask: size - 1,
             write_pos: 0,
         }
     }
 
+    #[inline(always)]
     fn write(&mut self, sample: Sample) {
         self.buffer[self.write_pos] = sample;
-        self.write_pos = (self.write_pos + 1) % self.buffer.len();
+        self.write_pos = (self.write_pos + 1) & self.mask;
     }
 
+    #[inline(always)]
     fn read(&self, delay_samples: usize) -> Sample {
-        let read_pos = (self.write_pos + self.buffer.len() - delay_samples) % self.buffer.len();
-        self.buffer[read_pos]
+        self.buffer[self.write_pos.wrapping_sub(delay_samples) & self.mask]
     }
 
+    #[inline(always)]
     fn read_interpolated(&self, delay_samples: f32) -> Sample {
         let delay_int = delay_samples as usize;
         let frac = delay_samples - delay_int as f32;
-
-        let s1 = self.read(delay_int);
-        let s2 = self.read(delay_int + 1);
-
+        let i0 = self.write_pos.wrapping_sub(delay_int) & self.mask;
+        let i1 = i0.wrapping_sub(1) & self.mask;
+        let s1 = self.buffer[i0];
+        let s2 = self.buffer[i1];
         s1 + frac * (s2 - s1)
     }
 
@@ -179,6 +184,7 @@ impl Delay {
     }
 
     /// Process stereo with ping-pong
+    #[link_section = ".iram1.text"]
     pub fn process_stereo(&mut self, input: StereoSample) -> StereoSample {
         let eff_time = (self.delay_time + self.time_mod).clamp(0.001, 2.0);
         let eff_feedback = (self.feedback + self.feedback_mod).clamp(0.0, 0.95);
@@ -253,6 +259,7 @@ impl CombFilter {
         }
     }
 
+    #[inline(always)]
     fn process(&mut self, input: Sample) -> Sample {
         let output = self.buffer[self.write_pos];
 
@@ -260,7 +267,10 @@ impl CombFilter {
         self.damp_state = output * (1.0 - self.damp) + self.damp_state * self.damp;
 
         self.buffer[self.write_pos] = input + self.damp_state * self.feedback;
-        self.write_pos = (self.write_pos + 1) % self.buffer.len();
+        self.write_pos += 1;
+        if self.write_pos >= self.buffer.len() {
+            self.write_pos = 0;
+        }
 
         output
     }
@@ -287,12 +297,16 @@ impl AllpassFilter {
         }
     }
 
+    #[inline(always)]
     fn process(&mut self, input: Sample) -> Sample {
         let delayed = self.buffer[self.write_pos];
         let output = -input + delayed;
 
         self.buffer[self.write_pos] = input + delayed * self.feedback;
-        self.write_pos = (self.write_pos + 1) % self.buffer.len();
+        self.write_pos += 1;
+        if self.write_pos >= self.buffer.len() {
+            self.write_pos = 0;
+        }
 
         output
     }
@@ -313,6 +327,9 @@ pub struct Reverb {
     mix: f32,       // Dry/wet mix
     sample_rate: SampleRate,
     mix_mod: f32, // Matrix modulation offset on mix
+    half_step: bool,
+    wet_l: Sample,
+    wet_r: Sample,
 }
 
 impl Reverb {
@@ -327,15 +344,19 @@ impl Reverb {
             mix: 0.3,
             sample_rate,
             mix_mod: 0.0,
+            half_step: false,
+            wet_l: 0.0,
+            wet_r: 0.0,
         };
         reverb.rebuild_filters();
         reverb
     }
 
     fn rebuild_filters(&mut self) {
-        // Comb filter delay times (in samples at 44100 Hz, scaled to current rate)
-        // Different delays for L/R create stereo width
-        let scale = self.sample_rate as f32 / 44100.0;
+        // Comb/allpass tanks run at half rate (22.05 kHz at 44.1 kHz): halving
+        // buffer lengths preserves exact delay times and RT60 decay while
+        // keeping the total working set (~24 KB) inside ESP32-S3's 32 KB D-cache.
+        let scale = (self.sample_rate as f32 / 44100.0) * 0.5;
         let comb_delays_l = [1116, 1188, 1277, 1356];
         let comb_delays_r = [1139, 1211, 1300, 1379]; // Slightly different for stereo
         let allpass_delays_l = [556, 441];
@@ -345,20 +366,20 @@ impl Reverb {
 
         self.combs_l = comb_delays_l
             .iter()
-            .map(|&d| CombFilter::new((d as f32 * scale) as usize, feedback, self.damping))
+            .map(|&d| CombFilter::new(((d as f32 * scale) as usize).max(1), feedback, self.damping))
             .collect();
         self.combs_r = comb_delays_r
             .iter()
-            .map(|&d| CombFilter::new((d as f32 * scale) as usize, feedback, self.damping))
+            .map(|&d| CombFilter::new(((d as f32 * scale) as usize).max(1), feedback, self.damping))
             .collect();
 
         self.allpasses_l = allpass_delays_l
             .iter()
-            .map(|&d| AllpassFilter::new((d as f32 * scale) as usize, 0.5))
+            .map(|&d| AllpassFilter::new(((d as f32 * scale) as usize).max(1), 0.5))
             .collect();
         self.allpasses_r = allpass_delays_r
             .iter()
-            .map(|&d| AllpassFilter::new((d as f32 * scale) as usize, 0.5))
+            .map(|&d| AllpassFilter::new(((d as f32 * scale) as usize).max(1), 0.5))
             .collect();
     }
 
@@ -404,34 +425,40 @@ impl Reverb {
     }
 
     /// Process stereo reverb
+    #[link_section = ".iram1.text"]
     pub fn process_stereo(&mut self, input: StereoSample) -> StereoSample {
-        // Sum of parallel comb filters (separate L/R)
-        let mut comb_sum_l: Sample = 0.0;
-        let mut comb_sum_r: Sample = 0.0;
-        for comb in &mut self.combs_l {
-            comb_sum_l += comb.process(input.left);
-        }
-        for comb in &mut self.combs_r {
-            comb_sum_r += comb.process(input.right);
-        }
-        comb_sum_l *= 0.25;
-        comb_sum_r *= 0.25;
+        self.half_step = !self.half_step;
+        if self.half_step {
+            // Sum of parallel comb filters (separate L/R)
+            let mut comb_sum_l: Sample = 0.0;
+            let mut comb_sum_r: Sample = 0.0;
+            for comb in &mut self.combs_l {
+                comb_sum_l += comb.process(input.left);
+            }
+            for comb in &mut self.combs_r {
+                comb_sum_r += comb.process(input.right);
+            }
+            comb_sum_l *= 0.25;
+            comb_sum_r *= 0.25;
 
-        // Series allpass filters for diffusion
-        let mut output_l = comb_sum_l;
-        let mut output_r = comb_sum_r;
-        for allpass in &mut self.allpasses_l {
-            output_l = allpass.process(output_l);
-        }
-        for allpass in &mut self.allpasses_r {
-            output_r = allpass.process(output_r);
+            // Series allpass filters for diffusion
+            let mut output_l = comb_sum_l;
+            let mut output_r = comb_sum_r;
+            for allpass in &mut self.allpasses_l {
+                output_l = allpass.process(output_l);
+            }
+            for allpass in &mut self.allpasses_r {
+                output_r = allpass.process(output_r);
+            }
+            self.wet_l = output_l;
+            self.wet_r = output_r;
         }
 
         // Mix dry and wet
         let eff_mix = (self.mix + self.mix_mod).clamp(0.0, 1.0);
         StereoSample::new(
-            input.left * (1.0 - eff_mix) + output_l * eff_mix,
-            input.right * (1.0 - eff_mix) + output_r * eff_mix,
+            input.left * (1.0 - eff_mix) + self.wet_l * eff_mix,
+            input.right * (1.0 - eff_mix) + self.wet_r * eff_mix,
         )
     }
 }
@@ -532,13 +559,26 @@ impl Chorus {
     }
 
     /// Process stereo chorus
+    #[link_section = ".iram1.text"]
     pub fn process_stereo(&mut self, input: StereoSample) -> StereoSample {
-        // LFO for left channel
-        let lfo_l = (self.lfo_phase * std::f32::consts::TAU).sin();
-        // LFO for right channel (phase offset for stereo width)
-        let lfo_r = ((self.lfo_phase + self.stereo_spread) * std::f32::consts::TAU).sin();
+        // Fast parabolic sine on normalized phase [0, 1): 4 muls, no LUT/OnceLock
+        #[inline(always)]
+        fn fast_sin01(p: f32) -> f32 {
+            let x = p - 0.5;
+            4.0 * x * (1.0 - 2.0 * x.abs())
+        }
+        let lfo_l = fast_sin01(self.lfo_phase);
+        let mut pr = self.lfo_phase + self.stereo_spread;
+        if pr >= 1.0 {
+            pr -= 1.0;
+        }
+        let lfo_r = fast_sin01(pr);
 
-        let eff_rate = (self.rate * 4.0f32.powf(self.rate_mod)).clamp(0.05, 20.0);
+        let eff_rate = if self.rate_mod == 0.0 {
+            self.rate
+        } else {
+            (self.rate * 4.0f32.powf(self.rate_mod)).clamp(0.05, 20.0)
+        };
         self.lfo_phase += eff_rate / self.sample_rate as f32;
         if self.lfo_phase >= 1.0 {
             self.lfo_phase -= 1.0;
@@ -732,8 +772,19 @@ impl EffectsChain {
     }
 
     /// Process stereo signal through effects chain
+    #[link_section = ".iram1.text"]
     pub fn process_stereo(&mut self, input: StereoSample) -> StereoSample {
-        let mut output = input;
+        if !self.distortion_enabled
+            && !self.chorus_enabled
+            && !self.delay_enabled
+            && !self.reverb_enabled
+        {
+            return input;
+        }
+        // Inject a tiny anti-denormal DC bias (-380 dBFS) when any effect is
+        // active so feedback states in chorus/delay/reverb never decay into
+        // subnormal software traps on Xtensa.
+        let mut output = StereoSample::new(input.left + 1e-19, input.right - 1e-19);
 
         // Process in order: Distortion → Chorus → Delay → Reverb
         if self.distortion_enabled {
