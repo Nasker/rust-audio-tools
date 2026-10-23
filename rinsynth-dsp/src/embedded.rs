@@ -263,6 +263,9 @@ pub struct LeanVoice {
     fenv_amount: f32,
     filter: TptSvf,
     filter_mode: FilterMode,
+    /// Wide-open lowpass with ~no resonance is audibly transparent — skip the
+    /// per-sample TPT state update entirely. Evaluated each control tick.
+    filter_bypass: bool,
     resonance: f32, // 0.0..1.0
     base_cutoff: Frequency,
     lfo: LFO,
@@ -314,6 +317,7 @@ impl LeanVoice {
             fenv_amount: 0.0,
             filter: TptSvf::new(),
             filter_mode: FilterMode::LowPass,
+            filter_bypass: false,
             resonance: 0.2,
             base_cutoff: 8000.0,
             lfo: LFO::new(ctrl_sr),
@@ -547,6 +551,30 @@ impl LeanVoice {
         let eff_reso = (self.resonance + reso_off).clamp(0.0, 1.0);
         self.filter
             .set(self.filter_mode, cutoff, eff_reso, self.sample_rate);
+        // Bypass the per-sample SVF when it would be a no-op audibly:
+        // lowpass, cutoff pinned at the top clamp, ~no resonance — AND no
+        // modulator currently able to pull it back down. apply_preset
+        // auto-routes LFO1->FilterCutoff for the mod wheel even with depth 0,
+        // so gate on the *effective* wheel depth (lfo_depth + CC1), not just
+        // the destination. Slots routing to cutoff/reso with nonzero amount
+        // and nonzero fenv stay live — no mid-note bypass flapping. On exit,
+        // reset integrator state; at wide-open cutoff re-entry is clickless.
+        let lfo_to_cutoff = self.lfo_dest == LfoDestination::FilterCutoff
+            && (self.lfo_depth + mod_wheel * 0.6) > 0.01;
+        let filter_modulated = self.fenv_amount.abs() > 0.01
+            || lfo_to_cutoff
+            || active_slots.iter().any(|s| {
+                matches!(s.dest, ModDest::FilterCutoff | ModDest::FilterResonance)
+                    && s.amount.abs() > 0.01
+            });
+        let bypass = self.filter_mode == FilterMode::LowPass
+            && eff_reso < 0.01
+            && cutoff >= self.sample_rate as f32 * 0.42 * 0.999
+            && !filter_modulated;
+        if self.filter_bypass && !bypass {
+            self.filter.reset();
+        }
+        self.filter_bypass = bypass;
 
         self.amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
     }
@@ -635,8 +663,11 @@ impl LeanVoice {
         }
 
         let _ft = profile::now();
-        let fl = self.filter.process(0, l);
-        let fr = self.filter.process(1, r);
+        let (fl, fr) = if self.filter_bypass {
+            (l, r)
+        } else {
+            (self.filter.process(0, l), self.filter.process(1, r))
+        };
         if profile::enabled() {
             profile::add(profile::FILTER, profile::now() - _ft);
         }
