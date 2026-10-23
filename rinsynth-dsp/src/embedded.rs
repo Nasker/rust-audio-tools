@@ -662,6 +662,7 @@ pub struct EmbeddedEngine {
     age_counter: u64,
     stereo_width: f32,
     comp_env: f32,        // stereo bus compressor/limiter envelope follower
+    comp_rate_scale: f32, // scales comp_env coefficients when rate != 44100
     voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
 }
 
@@ -684,8 +685,30 @@ impl EmbeddedEngine {
             age_counter: 0,
             stereo_width: 1.0,
             comp_env: 0.0,
+            comp_rate_scale: 1.0,
             voice_cap: max_voices,
         }
+    }
+
+    /// Switch the internal render rate (e.g. 44100 ↔ 22050 for a runtime
+    /// A/B). Re-derives every rate-dependent coefficient in place: filter and
+    /// osc increments recompute on the next control tick from `sample_rate`;
+    /// LFOs, envelopes and the FX chain get explicit `set_sample_rate`. Voices
+    /// keep sounding across the switch (envelope positions are preserved).
+    /// NOTE: `Delay::set_sample_rate` reallocates its delay lines — call from
+    /// a user-initiated toggle, not the per-block hot path.
+    pub fn set_sample_rate(&mut self, sample_rate: SampleRate) {
+        let ctrl_sr = (sample_rate / CONTROL_DIV).max(1);
+        for v in &mut self.voices {
+            v.sample_rate = sample_rate;
+            v.amp_env.set_sample_rate(sample_rate);
+            v.fenv.set_sample_rate(sample_rate);
+            v.env3.set_sample_rate(ctrl_sr);
+            v.lfo.set_sample_rate(ctrl_sr);
+            v.lfo2.set_sample_rate(ctrl_sr);
+        }
+        self.effects.set_sample_rate(sample_rate);
+        self.comp_rate_scale = sample_rate as f32 / 44_100.0;
     }
 
     /// Effective polyphony limit — `pick_voice` only allocates from the
@@ -1320,7 +1343,7 @@ impl EmbeddedEngine {
         // (~120 ms) release above 0.60 threshold so resonant or multi-voice
         // peaks are leveled cleanly without waveshaper buzz.
         let peak = out.left.abs().max(out.right.abs());
-        let coeff = if peak > self.comp_env { 0.015 } else { 0.0002 };
+        let coeff = if peak > self.comp_env { 0.015 } else { 0.0002 } * self.comp_rate_scale;
         self.comp_env += coeff * (peak - self.comp_env);
         if self.comp_env < 1e-18 {
             self.comp_env = 0.0;
