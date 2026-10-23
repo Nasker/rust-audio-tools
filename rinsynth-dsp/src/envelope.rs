@@ -67,6 +67,13 @@ pub trait Envelope: Send + Sync {
     fn release_time(&self) -> f32 {
         0.0
     }
+
+    /// Current output amplitude (0.0-1.0) — used by the CPU governor to shed
+    /// the quietest voice, whose fade-out is least audible. Default 1.0 so
+    /// unimplemented envelopes never look like the cheapest shed candidate.
+    fn level(&self) -> f32 {
+        1.0
+    }
 }
 
 /// Simple Attack-Release envelope
@@ -191,6 +198,10 @@ impl Envelope for AREnvelope {
 
     fn release_time(&self) -> f32 {
         self.release_time
+    }
+
+    fn level(&self) -> f32 {
+        self.current_amplitude
     }
 }
 
@@ -348,6 +359,10 @@ impl Envelope for ADSREnvelope {
 
     fn release_time(&self) -> f32 {
         self.release_time
+    }
+
+    fn level(&self) -> f32 {
+        self.current_amplitude
     }
 }
 

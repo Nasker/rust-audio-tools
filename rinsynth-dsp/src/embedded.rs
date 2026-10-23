@@ -754,23 +754,44 @@ impl EmbeddedEngine {
     }
 
     /// Fast-fade the least-important active voice to reclaim render budget.
-    /// Priority: oldest releasing tail first, then the oldest held non-bass
-    /// voice *above the cap* (the actual excess), then oldest held non-bass
-    /// anywhere. Uses a ~25 ms release so the shed is near-instant without a
-    /// hard click. Returns the MIDI note shed, if any.
+    /// Priority: the quietest meaningful release tail, then the quietest held
+    /// non-bass voice *above the cap* (the actual excess), then the quietest
+    /// held non-bass anywhere. Attack-state voices are never held-candidates —
+    /// a fresh note reads as quiet mid-ramp but is the most audible loss.
+    /// ~70 ms fade: fast relief, but reads as a release rather than a death.
+    /// Returns the MIDI note shed, if any.
     pub fn shed_voice(&mut self) -> Option<u8> {
         let lowest = self.voices.iter().filter(|v| v.active).map(|v| v.note).min();
-        let oldest_held = |vs: &[LeanVoice]| {
+        // Held candidates only — Decay/Sustain. Attack-state voices read as
+        // quiet mid-ramp but are the most audible loss, and Release voices
+        // are already dying (re-picking wastes the streak without freeing
+        // another voice).
+        let quietest = |vs: &[LeanVoice]| {
             vs.iter()
                 .enumerate()
-                .filter(|(_, v)| v.active && Some(v.note) != lowest)
-                .min_by_key(|(_, v)| v.age)
+                .filter(|(_, v)| {
+                    v.active
+                        && Some(v.note) != lowest
+                        && matches!(
+                            v.amp_env.state(),
+                            EnvelopeState::Decay | EnvelopeState::Sustain
+                        )
+                })
+                .min_by(|(_, a), (_, b)| {
+                    a.amp_env
+                        .level()
+                        .partial_cmp(&b.amp_env.level())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.age.cmp(&b.age))
+                })
                 .map(|(i, _)| i)
         };
-        // Prefer the oldest *meaningful* release tail — skip tails already
-        // fading out within ~30 ms (naturally short releases and voices this
-        // governor just shed). Re-picking the same dying voice wastes a shed
-        // streak without freeing any render budget.
+        // Prefer the quietest *meaningful* release tail — skip tails already
+        // fading within ~100 ms (naturally short releases and voices this
+        // governor just shed at the 70 ms fade). Re-picking a fading voice is
+        // worse than wasted: release() recomputes its decrement from the
+        // current amplitude, so each re-shed restarts a full 70 ms fade — the
+        // voice asymptotically approaches zero without ever deactivating.
         let idx = self
             .voices
             .iter()
@@ -778,17 +799,27 @@ impl EmbeddedEngine {
             .filter(|(_, v)| {
                 v.active
                     && v.amp_env.state() == EnvelopeState::Release
-                    && v.amp_env.release_time() > 0.03
+                    && v.amp_env.release_time() > 0.1
             })
-            .min_by_key(|(_, v)| v.age)
+            .min_by(|(_, a), (_, b)| {
+                a.amp_env
+                    .level()
+                    .partial_cmp(&b.amp_env.level())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.age.cmp(&b.age))
+            })
             .map(|(i, _)| i)
-            .or_else(|| oldest_held(&self.voices[self.voice_cap..]).map(|i| self.voice_cap + i))
-            .or_else(|| oldest_held(&self.voices))
+            .or_else(|| quietest(&self.voices[self.voice_cap..]).map(|i| self.voice_cap + i))
+            .or_else(|| quietest(&self.voices))
             .or_else(|| self.voices.iter().position(|v| v.active))?;
         let note = self.voices[idx].note;
-        // Fast fade (~25 ms) — quick CPU relief without a hard click. The
-        // configured release is restored on the next note_on via cfgd_release.
-        self.voices[idx].amp_env.set_release(0.025);
+        // ~70 ms fade — CPU relief within a few blocks, perceived as a quick
+        // release rather than a note vanishing. Apply it to held notes AND
+        // long natural tails (a 2 s release tail still burns CPU for 2 s —
+        // accelerate it). Voices picked here either aren't in Release or have
+        // release_time > 0.1, so re-releasing never extends a fast fade —
+        // the zombie-fade bug came from re-arming an already-short release.
+        self.voices[idx].amp_env.set_release(0.07);
         self.voices[idx].amp_env.release();
         self.voices[idx].fenv.release();
         self.voices[idx].env3.release();
