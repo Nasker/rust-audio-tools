@@ -30,16 +30,18 @@ pub mod profile {
     use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     /// Stage indices: envelopes, control tick, oscillators+mix, filters,
-    /// sample count.
+    /// FX chain, sample count.
     pub const ENV: usize = 0;
     pub const CONTROL: usize = 1;
     pub const OSC: usize = 2;
     pub const FILTER: usize = 3;
-    pub const SAMPLES: usize = 4;
-    const N: usize = 5;
+    pub const FX: usize = 4;
+    pub const SAMPLES: usize = 5;
+    const N: usize = 6;
 
     static HOOK: AtomicUsize = AtomicUsize::new(0);
     static COUNTERS: [AtomicU32; N] = [
+        AtomicU32::new(0),
         AtomicU32::new(0),
         AtomicU32::new(0),
         AtomicU32::new(0),

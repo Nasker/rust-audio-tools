@@ -24,6 +24,7 @@
 //! Target: ~700 cycles/voice-sample → 8 voices inside a 5.8 ms block.
 
 use super::effects::{DistortionType, EffectsChain};
+use crate::profile;
 use super::envelope::{ADSREnvelope, Envelope, EnvelopeState};
 use super::filter::FilterMode;
 use super::oscillator::sine_lut;
@@ -42,6 +43,21 @@ use std::f32::consts::PI;
 /// Samples between control-rate updates (LFO tick, mod matrix, filter coeffs).
 const CONTROL_DIV: u32 = 64;
 const MAX_OSCS: usize = 4;
+
+/// Cycle-count a pipeline stage when a profiler hook is installed; a single
+/// predictable branch per call otherwise.
+macro_rules! pstage {
+    ($idx:expr, $body:expr) => {{
+        if profile::enabled() {
+            let _t0 = profile::now();
+            let _r = $body;
+            profile::add($idx, profile::now() - _t0);
+            _r
+        } else {
+            $body
+        }
+    }};
+}
 
 /// PolyBLEP residual for a discontinuity at phase 0 (normalized t ∈ [0,1)).
 /// For pulse waves call again with the second edge's phase.
@@ -241,6 +257,9 @@ pub struct LeanVoice {
     amp_env: ADSREnvelope,
     fenv: ADSREnvelope,
     env3: ADSREnvelope,
+    /// Configured amp release — `shed_voice` temporarily shortens the live
+    /// release for a fast fade; `note_on` restores this value.
+    cfgd_release: f32,
     fenv_amount: f32,
     filter: TptSvf,
     filter_mode: FilterMode,
@@ -291,6 +310,7 @@ impl LeanVoice {
             amp_env: ADSREnvelope::new(0.01, 0.1, 0.7, 0.2, sample_rate),
             fenv: ADSREnvelope::new(0.01, 0.3, 0.0, 0.3, sample_rate),
             env3: ADSREnvelope::new(0.01, 0.3, 0.0, 0.3, ctrl_sr),
+            cfgd_release: 0.2,
             fenv_amount: 0.0,
             filter: TptSvf::new(),
             filter_mode: FilterMode::LowPass,
@@ -359,6 +379,9 @@ impl LeanVoice {
                 o.reset();
             }
         }
+        // Restore the configured release — a previous governor shed may have
+        // left a fast-fade release programmed on this envelope.
+        self.amp_env.set_release(self.cfgd_release);
         self.amp_env.trigger();
         self.fenv.trigger();
         self.env3.trigger();
@@ -540,14 +563,14 @@ impl LeanVoice {
         if !self.active {
             return StereoSample::ZERO;
         }
-        let amp = self.amp_env.next_amplitude();
+        let amp = pstage!(profile::ENV, self.amp_env.next_amplitude());
         if self.amp_env.is_finished() {
             self.active = false;
             return StereoSample::ZERO;
         }
         self.last_amp = amp;
         self.fenv_amp = if self.fenv_amount != 0.0 || !active_slots.is_empty() {
-            self.fenv.next_amplitude()
+            pstage!(profile::ENV, self.fenv.next_amplitude())
         } else {
             0.0
         };
@@ -561,12 +584,16 @@ impl LeanVoice {
         }
 
         if self.control_phase == 0 {
-            self.control_tick(bend_norm, bend_semitones, mod_wheel, aftertouch, active_slots);
+            pstage!(
+                profile::CONTROL,
+                self.control_tick(bend_norm, bend_semitones, mod_wheel, aftertouch, active_slots)
+            );
         }
         self.control_phase = (self.control_phase + 1) % CONTROL_DIV;
 
         let mut l = 0.0f32;
         let mut r = 0.0f32;
+        let _osct = profile::now();
         // Advance Osc 4 first when active (either audible or routed as an
         // audio-rate FM / Ring-Mod source in the mod matrix).
         let s4 = if self.gains[3].0 > 0.0
@@ -603,9 +630,16 @@ impl LeanVoice {
                 r += s * self.gains[i].1 * m;
             }
         }
+        if profile::enabled() {
+            profile::add(profile::OSC, profile::now() - _osct);
+        }
 
+        let _ft = profile::now();
         let fl = self.filter.process(0, l);
         let fr = self.filter.process(1, r);
+        if profile::enabled() {
+            profile::add(profile::FILTER, profile::now() - _ft);
+        }
         let g = amp * self.velocity * self.amp_lfo;
         StereoSample::new(fl * g, fr * g)
     }
@@ -628,6 +662,7 @@ pub struct EmbeddedEngine {
     age_counter: u64,
     stereo_width: f32,
     comp_env: f32,        // stereo bus compressor/limiter envelope follower
+    voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
 }
 
 impl EmbeddedEngine {
@@ -649,7 +684,57 @@ impl EmbeddedEngine {
             age_counter: 0,
             stereo_width: 1.0,
             comp_env: 0.0,
+            voice_cap: max_voices,
         }
+    }
+
+    /// Effective polyphony limit — `pick_voice` only allocates from the
+    /// first `cap` slots. Voices above the cap that are already sounding keep
+    /// their tails; shed them explicitly with `shed_voice`.
+    pub fn set_voice_cap(&mut self, n: usize) {
+        self.voice_cap = n.clamp(1, self.voices.len());
+    }
+
+    pub fn voice_cap(&self) -> usize {
+        self.voice_cap
+    }
+
+    /// Fast-fade the least-important active voice to reclaim render budget
+    /// (same priority order as voice stealing: oldest releasing tail first,
+    /// else oldest held note that isn't the protected lowest bass). Uses a
+    /// ~25 ms release so the shed is near-instant without a hard click.
+    /// Returns the MIDI note shed, if any.
+    pub fn shed_voice(&mut self) -> Option<u8> {
+        let idx = if let Some((i, _)) = self
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.active && v.amp_env.state() == EnvelopeState::Release)
+            .min_by_key(|(_, v)| v.age)
+        {
+            i
+        } else {
+            let lowest = self.voices.iter().filter(|v| v.active).map(|v| v.note).min();
+            match self
+                .voices
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.active && Some(v.note) != lowest)
+                .min_by_key(|(_, v)| v.age)
+                .map(|(i, _)| i)
+            {
+                Some(i) => i,
+                None => self.voices.iter().position(|v| v.active)?,
+            }
+        };
+        let note = self.voices[idx].note;
+        // Fast fade (~25 ms) — quick CPU relief without a hard click. The
+        // configured release is restored on the next note_on via cfgd_release.
+        self.voices[idx].amp_env.set_release(0.025);
+        self.voices[idx].amp_env.release();
+        self.voices[idx].fenv.release();
+        self.voices[idx].env3.release();
+        Some(note)
     }
 
     fn repack_mod_slots(&mut self) {
@@ -813,6 +898,7 @@ impl EmbeddedEngine {
             v.amp_env.set_decay(preset.amp_decay);
             v.amp_env.set_sustain(preset.amp_sustain);
             v.amp_env.set_release(preset.amp_release);
+            v.cfgd_release = preset.amp_release;
             v.fenv.set_attack(preset.filter_attack);
             v.fenv.set_decay(preset.filter_decay);
             v.fenv.set_sustain(preset.filter_sustain);
@@ -882,6 +968,7 @@ impl EmbeddedEngine {
             SynthParam::Release => {
                 for v in &mut self.voices {
                     v.amp_env.set_release(plain);
+                    v.cfgd_release = plain;
                 }
             }
             SynthParam::FilterCutoff => {
@@ -1167,20 +1254,20 @@ impl EmbeddedEngine {
         if self.polyphony != PolyphonyMode::Poly {
             return 0;
         }
+        let pool = &self.voices[..self.voice_cap];
         // 1. Retrigger: if a voice is already playing this exact MIDI note
         //    (whether held or in its release tail), reuse it so hammering notes
         //    never exhausts the polyphony pool with duplicate tails.
-        if let Some(i) = self.voices.iter().position(|v| v.active && v.note == note) {
+        if let Some(i) = pool.iter().position(|v| v.active && v.note == note) {
             return i;
         }
         // 2. Idle voice: pick the first completely free slot.
-        if let Some(i) = self.voices.iter().position(|v| !v.active) {
+        if let Some(i) = pool.iter().position(|v| !v.active) {
             return i;
         }
         // 3. Releasing voice: steal the oldest releasing voice so held notes
         //    (Attack/Decay/Sustain) are never killed by release tails.
-        if let Some((i, _)) = self
-            .voices
+        if let Some((i, _)) = pool
             .iter()
             .enumerate()
             .filter(|(_, v)| v.amp_env.state() == EnvelopeState::Release)
@@ -1190,13 +1277,12 @@ impl EmbeddedEngine {
         }
         // 4. All voices are physically held: protect the lowest held bass note
         //    and steal the oldest among the remaining held voices.
-        let lowest_note = self.voices.iter().map(|v| v.note).min().unwrap_or(0);
-        self.voices
-            .iter()
+        let lowest_note = pool.iter().map(|v| v.note).min().unwrap_or(0);
+        pool.iter()
             .enumerate()
             .filter(|(_, v)| v.note != lowest_note)
             .min_by_key(|(_, v)| v.age)
-            .or_else(|| self.voices.iter().enumerate().min_by_key(|(_, v)| v.age))
+            .or_else(|| pool.iter().enumerate().min_by_key(|(_, v)| v.age))
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
@@ -1221,7 +1307,14 @@ impl EmbeddedEngine {
         if self.stereo_width != 1.0 {
             out = out.with_width(self.stereo_width);
         }
-        out = self.effects.process_stereo(out) * self.master_volume;
+        if profile::enabled() {
+            profile::add(profile::SAMPLES, 1);
+            let _ft = profile::now();
+            out = self.effects.process_stereo(out) * self.master_volume;
+            profile::add(profile::FX, profile::now() - _ft);
+        } else {
+            out = self.effects.process_stereo(out) * self.master_volume;
+        }
 
         // Stereo bus peak compressor/limiter: fast (~1.5 ms) attack, smooth
         // (~120 ms) release above 0.60 threshold so resonant or multi-voice

@@ -639,6 +639,10 @@ pub struct Distortion {
     drive: f32,
     mix: f32,
     dtype: DistortionType,
+    // Precomputed level compensation (sqrt denominators are soft-float on
+    // Xtensa — cache them in set_drive instead of computing per sample).
+    tube_comp: f32,
+    fuzz_comp: f32,
     // Bitcrush: samples held so far and held value, per channel [L, R].
     bc_count: [u32; 2],
     bc_held: [Sample; 2],
@@ -650,6 +654,8 @@ impl Distortion {
             drive: 0.0,
             mix: 0.5,
             dtype: DistortionType::Tube,
+            tube_comp: 1.0,
+            fuzz_comp: 1.25,
             bc_count: [0; 2],
             bc_held: [0.0; 2],
         }
@@ -663,14 +669,22 @@ impl Distortion {
         match self.dtype {
             DistortionType::Tube => {
                 let gain = 1.0 + 29.0 * self.drive;
-                // tanh clip, then divide back by a gentle sqrt so loudness is tame
-                (x * gain).tanh() / gain.sqrt()
+                // tanh clip via Pade [3/3] (<=0.02 error for |x|<3; saturates
+                // past it) — libm tanh is soft-float and costly on Xtensa.
+                let y = x * gain;
+                let y2 = y * y;
+                let t = if y.abs() > 3.0 {
+                    y.signum()
+                } else {
+                    y * (27.0 + y2) / (27.0 + 9.0 * y2)
+                };
+                t * self.tube_comp
             }
             DistortionType::Fuzz => {
                 let gain = 1.0 + 49.0 * self.drive;
                 // Bias for asymmetry, then hard clip; keep level roughly even.
                 let y = x * gain + 0.3 * self.drive;
-                y.clamp(-0.8, 0.8) * 1.25 / (1.0 + 1.5 * self.drive).sqrt()
+                y.clamp(-0.8, 0.8) * self.fuzz_comp
             }
             DistortionType::Bitcrush => {
                 // Drive → hold length 1..48 samples and bit depth 12..3 bits.
@@ -687,7 +701,13 @@ impl Distortion {
             DistortionType::Fold => {
                 let gain = 1.0 + 29.0 * self.drive;
                 // Sine fold: bounded, no DC offset, turns saws into clusters.
-                (x * gain * 0.5).sin() * 0.9
+                // sine_lut only wraps ±1 turn, so wrap the (large) argument
+                // first — avoids libm sinf range reduction on Xtensa.
+                const INV_TAU: f32 = 1.0 / (2.0 * core::f32::consts::PI);
+                const TAU: f32 = 2.0 * core::f32::consts::PI;
+                let p = x * gain * 0.5;
+                let wrapped = p - (p * INV_TAU).floor() * TAU;
+                crate::oscillator::sine_lut(wrapped) * 0.9
             }
         }
     }
@@ -703,6 +723,9 @@ impl Distortion {
 
     pub fn set_drive(&mut self, drive: f32) {
         self.drive = drive.clamp(0.0, 1.0);
+        // Tube: 1/sqrt(1+29d); Fuzz: 1.25/sqrt(1+1.5d)
+        self.tube_comp = 1.0 / (1.0 + 29.0 * self.drive).sqrt();
+        self.fuzz_comp = 1.25 / (1.0 + 1.5 * self.drive).sqrt();
     }
     pub fn set_mix(&mut self, mix: f32) {
         self.mix = mix.clamp(0.0, 1.0);
