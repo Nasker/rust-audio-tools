@@ -753,34 +753,30 @@ impl EmbeddedEngine {
         self.voice_cap
     }
 
-    /// Fast-fade the least-important active voice to reclaim render budget
-    /// (same priority order as voice stealing: oldest releasing tail first,
-    /// else oldest held note that isn't the protected lowest bass). Uses a
-    /// ~25 ms release so the shed is near-instant without a hard click.
-    /// Returns the MIDI note shed, if any.
+    /// Fast-fade the least-important active voice to reclaim render budget.
+    /// Priority: oldest releasing tail first, then the oldest held non-bass
+    /// voice *above the cap* (the actual excess), then oldest held non-bass
+    /// anywhere. Uses a ~25 ms release so the shed is near-instant without a
+    /// hard click. Returns the MIDI note shed, if any.
     pub fn shed_voice(&mut self) -> Option<u8> {
-        let idx = if let Some((i, _)) = self
+        let lowest = self.voices.iter().filter(|v| v.active).map(|v| v.note).min();
+        let oldest_held = |vs: &[LeanVoice]| {
+            vs.iter()
+                .enumerate()
+                .filter(|(_, v)| v.active && Some(v.note) != lowest)
+                .min_by_key(|(_, v)| v.age)
+                .map(|(i, _)| i)
+        };
+        let idx = self
             .voices
             .iter()
             .enumerate()
             .filter(|(_, v)| v.active && v.amp_env.state() == EnvelopeState::Release)
             .min_by_key(|(_, v)| v.age)
-        {
-            i
-        } else {
-            let lowest = self.voices.iter().filter(|v| v.active).map(|v| v.note).min();
-            match self
-                .voices
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| v.active && Some(v.note) != lowest)
-                .min_by_key(|(_, v)| v.age)
-                .map(|(i, _)| i)
-            {
-                Some(i) => i,
-                None => self.voices.iter().position(|v| v.active)?,
-            }
-        };
+            .map(|(i, _)| i)
+            .or_else(|| oldest_held(&self.voices[self.voice_cap..]).map(|i| self.voice_cap + i))
+            .or_else(|| oldest_held(&self.voices))
+            .or_else(|| self.voices.iter().position(|v| v.active))?;
         let note = self.voices[idx].note;
         // Fast fade (~25 ms) — quick CPU relief without a hard click. The
         // configured release is restored on the next note_on via cfgd_release.
@@ -1329,8 +1325,34 @@ impl EmbeddedEngine {
         {
             return i;
         }
-        // 4. All voices are physically held: protect the lowest held bass note
-        //    and steal the oldest among the remaining held voices.
+        // 4. Over-cap voices are already marked for death — steal one before
+        //    touching a held in-pool voice. Prefer releasing tails, then the
+        //    oldest held non-bass note in the excess slots. Stealing an excess
+        //    slot keeps the active count flat (the replaced voice dies with
+        //    it) and the fresh age protects the new note from the next shed.
+        //    An idle excess slot is NOT taken: a note there would be the only
+        //    held excess voice and thus the governor's first shed candidate.
+        if self.voice_cap < self.voices.len() {
+            let excess = &self.voices[self.voice_cap..];
+            let lowest = self.voices.iter().filter(|v| v.active).map(|v| v.note).min();
+            if let Some((i, _)) = excess
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.active && v.amp_env.state() == EnvelopeState::Release)
+                .min_by_key(|(_, v)| v.age)
+                .or_else(|| {
+                    excess
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| v.active && Some(v.note) != lowest)
+                        .min_by_key(|(_, v)| v.age)
+                })
+            {
+                return self.voice_cap + i;
+            }
+        }
+        // 5. All in-pool voices are physically held: protect the lowest held
+        //    bass note and steal the oldest among the remaining held voices.
         let lowest_note = pool.iter().map(|v| v.note).min().unwrap_or(0);
         pool.iter()
             .enumerate()
