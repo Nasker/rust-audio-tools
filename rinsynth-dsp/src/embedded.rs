@@ -767,11 +767,19 @@ impl EmbeddedEngine {
                 .min_by_key(|(_, v)| v.age)
                 .map(|(i, _)| i)
         };
+        // Prefer the oldest *meaningful* release tail — skip tails already
+        // fading out within ~30 ms (naturally short releases and voices this
+        // governor just shed). Re-picking the same dying voice wastes a shed
+        // streak without freeing any render budget.
         let idx = self
             .voices
             .iter()
             .enumerate()
-            .filter(|(_, v)| v.active && v.amp_env.state() == EnvelopeState::Release)
+            .filter(|(_, v)| {
+                v.active
+                    && v.amp_env.state() == EnvelopeState::Release
+                    && v.amp_env.release_time() > 0.03
+            })
             .min_by_key(|(_, v)| v.age)
             .map(|(i, _)| i)
             .or_else(|| oldest_held(&self.voices[self.voice_cap..]).map(|i| self.voice_cap + i))
