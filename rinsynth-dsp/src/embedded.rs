@@ -695,6 +695,13 @@ pub struct EmbeddedEngine {
     comp_env: f32,        // stereo bus compressor/limiter envelope follower
     comp_rate_scale: f32, // scales comp_env coefficients when rate != 44100
     voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
+    bpm: f32,             // tempo in BPM (20..300) for synced LFOs and delay
+    lfo1_rate: f32,       // unsynced LFO1 rate in Hz
+    lfo1_sync: bool,
+    lfo1_beats: f32,      // LFO1 period in quarter-note beats when synced
+    lfo2_rate: f32,       // unsynced LFO2 rate in Hz
+    lfo2_sync: bool,
+    lfo2_beats: f32,      // LFO2 period in quarter-note beats when synced
 }
 
 impl EmbeddedEngine {
@@ -718,6 +725,13 @@ impl EmbeddedEngine {
             comp_env: 0.0,
             comp_rate_scale: 1.0,
             voice_cap: max_voices,
+            bpm: 120.0,
+            lfo1_rate: 4.0,
+            lfo1_sync: false,
+            lfo1_beats: 1.0,
+            lfo2_rate: 3.0,
+            lfo2_sync: false,
+            lfo2_beats: 1.0,
         }
     }
 
@@ -866,11 +880,100 @@ impl EmbeddedEngine {
         }
     }
 
-    pub fn set_lfo2_rate(&mut self, rate: f32) {
-        let r = rate.clamp(0.05, 30.0);
-        for v in &mut self.voices {
-            v.lfo2.set_rate(r);
+    #[inline]
+    fn effective_lfo1_rate(&self) -> f32 {
+        if self.lfo1_sync {
+            (self.bpm / 60.0) / self.lfo1_beats.max(0.01)
+        } else {
+            self.lfo1_rate
         }
+        .clamp(0.05, 20.0)
+    }
+
+    #[inline]
+    fn effective_lfo2_rate(&self) -> f32 {
+        if self.lfo2_sync {
+            (self.bpm / 60.0) / self.lfo2_beats.max(0.01)
+        } else {
+            self.lfo2_rate
+        }
+        .clamp(0.05, 20.0)
+    }
+
+    fn update_lfo_rates(&mut self) {
+        let r1 = self.effective_lfo1_rate();
+        let r2 = self.effective_lfo2_rate();
+        for v in &mut self.voices {
+            v.lfo_rate = r1;
+            v.lfo.set_rate(r1);
+            v.lfo2.set_rate(r2);
+        }
+    }
+
+    /// Set tempo in BPM (20..300) and recompute tempo-synced LFOs + Delay.
+    pub fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = bpm.clamp(20.0, 300.0);
+        self.effects.set_bpm(self.bpm);
+        self.update_lfo_rates();
+    }
+
+    pub fn bpm(&self) -> f32 {
+        self.bpm
+    }
+
+    pub fn set_lfo1_sync(&mut self, sync: bool, beats: f32) {
+        self.lfo1_sync = sync;
+        self.lfo1_beats = beats.clamp(0.05, 16.0);
+        self.update_lfo_rates();
+    }
+
+    pub fn set_lfo1_sync_enabled(&mut self, sync: bool) {
+        self.lfo1_sync = sync;
+        self.update_lfo_rates();
+    }
+
+    pub fn set_lfo1_beats(&mut self, beats: f32) {
+        self.lfo1_beats = beats.clamp(0.05, 16.0);
+        self.update_lfo_rates();
+    }
+
+    pub fn lfo1_sync(&self) -> (bool, f32) {
+        (self.lfo1_sync, self.lfo1_beats)
+    }
+
+    pub fn set_lfo2_sync(&mut self, sync: bool, beats: f32) {
+        self.lfo2_sync = sync;
+        self.lfo2_beats = beats.clamp(0.05, 16.0);
+        self.update_lfo_rates();
+    }
+
+    pub fn set_lfo2_sync_enabled(&mut self, sync: bool) {
+        self.lfo2_sync = sync;
+        self.update_lfo_rates();
+    }
+
+    pub fn set_lfo2_beats(&mut self, beats: f32) {
+        self.lfo2_beats = beats.clamp(0.05, 16.0);
+        self.update_lfo_rates();
+    }
+
+    pub fn lfo2_sync(&self) -> (bool, f32) {
+        (self.lfo2_sync, self.lfo2_beats)
+    }
+
+    pub fn set_delay_sync(&mut self, sync: bool) {
+        let beats = self.effects.delay_sync_beats();
+        self.effects.set_delay_tempo_sync(sync, beats);
+    }
+
+    pub fn set_delay_beats(&mut self, beats: f32) {
+        let sync = self.effects.delay_tempo_sync();
+        self.effects.set_delay_tempo_sync(sync, beats);
+    }
+
+    pub fn set_lfo2_rate(&mut self, rate: f32) {
+        self.lfo2_rate = rate.clamp(0.05, 30.0);
+        self.update_lfo_rates();
     }
 
     pub fn set_lfo2_depth(&mut self, depth: f32) {
@@ -945,6 +1048,16 @@ impl EmbeddedEngine {
             lfo_dest = LfoDestination::FilterCutoff;
         }
 
+        self.bpm = preset.tempo_bpm.clamp(20.0, 300.0);
+        self.lfo1_rate = preset.lfo_rate;
+        self.lfo1_sync = preset.lfo1_sync;
+        self.lfo1_beats = preset.lfo1_beats.clamp(0.05, 16.0);
+        self.lfo2_rate = preset.lfo2_rate.max(0.05);
+        self.lfo2_sync = preset.lfo2_sync;
+        self.lfo2_beats = preset.lfo2_beats.clamp(0.05, 16.0);
+        let eff_lfo1_rate = self.effective_lfo1_rate();
+        let eff_lfo2_rate = self.effective_lfo2_rate();
+
         for v in &mut self.voices {
             v.oscs[0].kind = preset.osc1_waveform;
             v.oscs[0].set_duty(preset.osc1_pw);
@@ -999,13 +1112,13 @@ impl EmbeddedEngine {
             v.fenv_amount = preset.filter_env_amount;
             v.base_cutoff = preset.filter_cutoff;
             v.resonance = reso;
-            v.lfo_rate = preset.lfo_rate;
-            v.lfo.set_rate(preset.lfo_rate);
+            v.lfo_rate = eff_lfo1_rate;
+            v.lfo.set_rate(eff_lfo1_rate);
             v.lfo_depth = preset.lfo_depth;
             v.lfo.set_depth(preset.lfo_depth);
             v.lfo.set_waveform(preset.lfo_waveform);
             v.lfo_dest = lfo_dest;
-            v.lfo2.set_rate(preset.lfo2_rate.max(0.05));
+            v.lfo2.set_rate(eff_lfo2_rate);
             v.lfo2.set_depth(preset.lfo2_depth.clamp(0.0, 1.0));
             v.lfo2.set_waveform(preset.lfo2_waveform);
         }
@@ -1097,10 +1210,8 @@ impl EmbeddedEngine {
                 }
             }
             SynthParam::LfoRate => {
-                for v in &mut self.voices {
-                    v.lfo_rate = plain;
-                    v.lfo.set_rate(plain);
-                }
+                self.lfo1_rate = plain;
+                self.update_lfo_rates();
             }
             SynthParam::LfoDepth => {
                 for v in &mut self.voices {
@@ -1581,5 +1692,51 @@ mod tests {
                 .any(|v| v.active && v.note == 36 && v.amp_env.state() != EnvelopeState::Release);
             assert!(bass_alive, "held bass note 36 was killed at round {round}");
         }
+    }
+
+    #[test]
+    fn tempo_sync_updates_lfos_and_delay_across_bpm_and_presets() {
+        let mut e = engine();
+        // Unsynced baseline
+        e.set_param(SynthParam::LfoRate, 4.5);
+        e.set_lfo2_rate(3.25);
+        assert!((e.voices[0].lfo.rate() - 4.5).abs() < 1e-4);
+        assert!((e.voices[0].lfo2.rate() - 3.25).abs() < 1e-4);
+
+        // Sync LFO1 to 1/8 note (0.5 beats) and LFO2 to 1 bar (4.0 beats) at 120 BPM (2 beats/sec)
+        e.set_bpm(120.0);
+        e.set_lfo1_sync(true, 0.5);
+        e.set_lfo2_sync(true, 4.0);
+        e.effects.set_delay_tempo_sync(true, 0.75); // dotted eighth = 0.375 s @ 120 BPM
+        assert!((e.voices[0].lfo.rate() - 4.0).abs() < 1e-4);
+        assert!((e.voices[0].lfo2.rate() - 0.5).abs() < 1e-4);
+        assert!((e.effects.delay_time() - 0.375).abs() < 1e-4);
+
+        // Changing BPM rescales LFO1, LFO2, and Delay simultaneously
+        e.set_bpm(150.0); // 2.5 beats/sec
+        assert!((e.voices[0].lfo.rate() - 5.0).abs() < 1e-4);
+        assert!((e.voices[0].lfo2.rate() - 0.625).abs() < 1e-4);
+        assert!((e.effects.delay_time() - 0.30).abs() < 1e-4);
+
+        // Disabling sync restores the stored unsynced Hz rates
+        e.set_lfo1_sync_enabled(false);
+        e.set_lfo2_sync_enabled(false);
+        assert!((e.voices[0].lfo.rate() - 4.5).abs() < 1e-4);
+        assert!((e.voices[0].lfo2.rate() - 3.25).abs() < 1e-4);
+
+        // Preset with tempo sync applies synced rates directly
+        let mut p = Preset::default();
+        p.tempo_bpm = 140.0;
+        p.lfo1_sync = true;
+        p.lfo1_beats = 0.25; // 1/16 -> (140/60)/0.25 = 9.3333 Hz
+        p.lfo2_sync = true;
+        p.lfo2_beats = 2.0; // 1/2 -> (140/60)/2.0 = 1.1667 Hz
+        p.delay_sync = true;
+        p.delay_beats = 0.5; // 1/8 -> 0.5 * 60 / 140 = 0.2142857 s
+        e.apply_preset(&p);
+        assert!((e.bpm() - 140.0).abs() < 1e-4);
+        assert!((e.voices[0].lfo.rate() - (140.0 / 60.0 / 0.25)).abs() < 1e-3);
+        assert!((e.voices[0].lfo2.rate() - (140.0 / 60.0 / 2.0)).abs() < 1e-3);
+        assert!((e.effects.delay_time() - (0.5 * 60.0 / 140.0)).abs() < 1e-4);
     }
 }
