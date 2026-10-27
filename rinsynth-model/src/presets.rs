@@ -169,6 +169,17 @@ pub struct Preset {
     #[serde(default)]
     pub polyphony_mode: PolyphonyMode,
 
+    // Unison (monophonic mode): stack N voices on the held note with
+    // symmetric detune + stereo spread for supersaw-style thickness.
+    #[serde(default = "default_unison_voices")]
+    pub unison_voices: u8,
+    /// Max pitch deviation in cents at the unison edges (0 = no detune).
+    #[serde(default = "default_unison_detune")]
+    pub unison_detune: f32,
+    /// Stereo spread 0..1 across unison voices.
+    #[serde(default = "default_unison_spread")]
+    pub unison_spread: f32,
+
     // Effects - Distortion
     #[serde(default)]
     pub distortion_enabled: bool,
@@ -313,6 +324,9 @@ impl Default for Preset {
 
             // Polyphony (default mono)
             polyphony_mode: PolyphonyMode::Mono,
+            unison_voices: 1,
+            unison_detune: 15.0,
+            unison_spread: 0.7,
 
             // Effects - Delay (default off)
             distortion_enabled: false,
@@ -455,6 +469,18 @@ fn default_beat() -> f32 {
 
 fn default_env4() -> [f32; 4] {
     [0.01, 0.3, 0.0, 0.3]
+}
+
+fn default_unison_voices() -> u8 {
+    1
+}
+
+fn default_unison_detune() -> f32 {
+    15.0
+}
+
+fn default_unison_spread() -> f32 {
+    0.7
 }
 
 fn default_osc4_waveform() -> WaveformType {

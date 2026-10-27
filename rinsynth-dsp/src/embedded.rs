@@ -43,6 +43,8 @@ use std::f32::consts::PI;
 /// Samples between control-rate updates (LFO tick, mod matrix, filter coeffs).
 const CONTROL_DIV: u32 = 64;
 const MAX_OSCS: usize = 4;
+/// Mono-mode key stack capacity (last-note priority, newest on top).
+const KEY_STACK_CAP: usize = 16;
 
 /// Cycle-count a pipeline stage when a profiler hook is installed; a single
 /// predictable branch per call otherwise.
@@ -290,6 +292,13 @@ pub struct LeanVoice {
     osc4_fm: f32,
     /// Audio-rate Ring-Mod amount from Osc4 -> Osc1Level/Amplitude
     osc4_rm: f32,
+    /// Unison pitch multiplier (mono-mode voice stacking) — folded into
+    /// `set_osc_freqs`; 1.0 for a plain poly/mono voice.
+    uni_mul: f32,
+    /// Unison stereo gain pair applied to the voice output — includes the
+    /// 1/sqrt(n) loudness compensation so a unison stack doesn't slam the
+    /// bus compressor. (1.0, 1.0) = unity stereo.
+    uni_gain: (f32, f32),
     sample_rate: SampleRate,
 }
 
@@ -340,6 +349,8 @@ impl LeanVoice {
             env3_amp: 0.0,
             osc4_fm: 0.0,
             osc4_rm: 0.0,
+            uni_mul: 1.0,
+            uni_gain: (1.0, 1.0),
             sample_rate,
         }
     }
@@ -395,6 +406,13 @@ impl LeanVoice {
 
     fn note_off(&mut self, note: MidiNote) {
         if self.active && self.note == note {
+            self.force_release();
+        }
+    }
+
+    /// Release regardless of the sounding note (mode switches, panic).
+    fn force_release(&mut self) {
+        if self.active {
             self.amp_env.release();
             self.fenv.release();
             self.env3.release();
@@ -411,7 +429,7 @@ impl LeanVoice {
                 2.0f32.powf(per_osc_semi[i] / 12.0)
             };
             self.oscs[i].set_freq(
-                self.base_freq * self.detune[i] * bend * osc_mul,
+                self.base_freq * self.detune[i] * bend * osc_mul * self.uni_mul,
                 self.sample_rate,
             );
         }
@@ -672,7 +690,7 @@ impl LeanVoice {
             profile::add(profile::FILTER, profile::now() - _ft);
         }
         let g = amp * self.velocity * self.amp_lfo;
-        StereoSample::new(fl * g, fr * g)
+        StereoSample::new(fl * g * self.uni_gain.0, fr * g * self.uni_gain.1)
     }
 }
 
@@ -690,6 +708,16 @@ pub struct EmbeddedEngine {
     bend_range: f32,      // semitones
     portamento: f32,
     polyphony: PolyphonyMode,
+    /// Mono-mode key stack (last-note priority — newest on top), matching
+    /// the desktop `VoiceManager::key_stack` semantics.
+    key_stack: [(MidiNote, Amplitude); KEY_STACK_CAP],
+    key_stack_len: usize,
+    /// Mono unison stack: voices triggered per note (1 = classic mono).
+    unison_count: usize,
+    /// Max unison pitch deviation in cents at the stack edges.
+    unison_detune: f32,
+    /// Stereo spread 0..1 across unison voices.
+    unison_spread: f32,
     age_counter: u64,
     stereo_width: f32,
     comp_env: f32,        // stereo bus compressor/limiter envelope follower
@@ -720,6 +748,11 @@ impl EmbeddedEngine {
             bend_range: 12.0,
             portamento: 0.0,
             polyphony: PolyphonyMode::Poly,
+            key_stack: [(0, 0.0); KEY_STACK_CAP],
+            key_stack_len: 0,
+            unison_count: 1,
+            unison_detune: 15.0,
+            unison_spread: 0.7,
             age_counter: 0,
             stereo_width: 1.0,
             comp_env: 0.0,
@@ -765,6 +798,126 @@ impl EmbeddedEngine {
 
     pub fn voice_cap(&self) -> usize {
         self.voice_cap
+    }
+
+    /// Switch between Poly and Mono. Desktop `VoiceManager` semantics: no-op
+    /// when unchanged; on a real switch the key stack is cleared and every
+    /// voice is released (envelopes release, not killed).
+    pub fn set_polyphony_mode(&mut self, mode: PolyphonyMode) {
+        if self.polyphony == mode {
+            return;
+        }
+        self.polyphony = mode;
+        self.key_stack_len = 0;
+        for v in &mut self.voices {
+            v.force_release();
+        }
+    }
+
+    pub fn polyphony_mode(&self) -> PolyphonyMode {
+        self.polyphony
+    }
+
+    /// Mono-mode unison stack size (1..=voice count).
+    pub fn set_unison_count(&mut self, n: usize) {
+        self.unison_count = n.clamp(1, self.voices.len());
+    }
+
+    /// Unison pitch spread in cents (max deviation at the stack edges).
+    pub fn set_unison_detune(&mut self, cents: f32) {
+        self.unison_detune = cents.clamp(0.0, 50.0);
+    }
+
+    /// Unison stereo spread 0..1.
+    pub fn set_unison_spread(&mut self, spread: f32) {
+        self.unison_spread = spread.clamp(0.0, 1.0);
+    }
+
+    pub fn unison(&self) -> (usize, f32, f32) {
+        (self.unison_count, self.unison_detune, self.unison_spread)
+    }
+
+    /// Trigger the mono voice stack: `unison` voice slots on the same note
+    /// with symmetric detune/pan offsets and decorrelated start phases.
+    /// Legato glide + envelope retrigger come from `LeanVoice::note_on`,
+    /// matching the desktop mono behaviour.
+    fn trigger_mono(&mut self, note: MidiNote, velocity: Amplitude) {
+        let n = self
+            .unison_count
+            .clamp(1, self.voice_cap.min(self.voices.len()));
+        let det = self.unison_detune;
+        let spr = self.unison_spread;
+        let portamento = self.portamento;
+        let age = self.age_counter;
+        // 1/sqrt(n) keeps a unison stack at roughly single-voice loudness.
+        let comp = (n as f32).sqrt().recip();
+        for (k, v) in self.voices[..n].iter_mut().enumerate() {
+            let off = if n > 1 {
+                (k as f32 / (n - 1) as f32) * 2.0 - 1.0
+            } else {
+                0.0
+            };
+            v.uni_mul = 2.0f32.powf(off * det / 1200.0);
+            // Linear pan taper on an already-stereo voice (centre = unity).
+            let pan = off * spr;
+            v.uni_gain = (
+                (1.0 - pan.max(0.0)) * comp,
+                (1.0 + pan.min(0.0)) * comp,
+            );
+            let was = v.active;
+            v.note_on(note, velocity, portamento, age);
+            if !was {
+                // Decorrelate start phases — all-unison voices at phase 0
+                // sum as one loud voice instead of a detuned chorus.
+                for (j, o) in v.oscs.iter_mut().enumerate() {
+                    o.phase = ((k + 1) as f32 * 0.618_034 + j as f32 * 0.377).fract();
+                }
+            }
+        }
+    }
+
+    /// Monophonic note-on with last-note-priority key stacking (port of the
+    /// desktop `handle_note_on_mono`).
+    fn note_on_mono(&mut self, note: MidiNote, velocity: Amplitude) {
+        // Remove the note if already held, then push on top of the stack.
+        self.stack_remove(note);
+        if self.key_stack_len == KEY_STACK_CAP {
+            self.key_stack.copy_within(1.., 0); // drop the oldest held note
+            self.key_stack_len -= 1;
+        }
+        self.key_stack[self.key_stack_len] = (note, velocity);
+        self.key_stack_len += 1;
+        self.trigger_mono(note, velocity);
+    }
+
+    /// Monophonic note-off: pop the note; if it was the sounding one,
+    /// fall back to the previous held note (legato retrigger) or release.
+    fn note_off_mono(&mut self, note: MidiNote) {
+        let was_current =
+            self.key_stack_len > 0 && self.key_stack[self.key_stack_len - 1].0 == note;
+        self.stack_remove(note);
+        if !was_current {
+            return;
+        }
+        if self.key_stack_len > 0 {
+            let (note, vel) = self.key_stack[self.key_stack_len - 1];
+            self.trigger_mono(note, vel);
+        } else {
+            for v in &mut self.voices {
+                v.note_off(note);
+            }
+        }
+    }
+
+    fn stack_remove(&mut self, note: MidiNote) {
+        let mut w = 0;
+        for i in 0..self.key_stack_len {
+            if self.key_stack[i].0 != note {
+                self.key_stack[w] = self.key_stack[i];
+                w += 1;
+            }
+        }
+        self.key_stack_len = w;
     }
 
     /// Fast-fade the least-important active voice to reclaim render budget.
@@ -1033,7 +1186,10 @@ impl EmbeddedEngine {
 
     pub fn apply_preset(&mut self, preset: &Preset) {
         self.portamento = preset.portamento_time;
-        self.polyphony = preset.polyphony_mode;
+        self.set_polyphony_mode(preset.polyphony_mode);
+        self.set_unison_count(preset.unison_voices as usize);
+        self.set_unison_detune(preset.unison_detune);
+        self.set_unison_spread(preset.unison_spread);
         self.bend_range = preset.pitch_bend_range as f32;
         self.stereo_width = preset.stereo_width;
         self.master_volume = preset.master_volume.clamp(0.0, 1.0);
@@ -1407,19 +1563,25 @@ impl EmbeddedEngine {
         match event.kind {
             SynthEventKind::NoteOn => {
                 self.age_counter += 1;
-                let idx = self.pick_voice(event.note);
-                self.voices[idx].note_on(
-                    event.note,
-                    event.velocity,
-                    self.portamento,
-                    self.age_counter,
-                );
-            }
-            SynthEventKind::NoteOff => {
-                for v in &mut self.voices {
-                    v.note_off(event.note);
+                match self.polyphony {
+                    PolyphonyMode::Mono => self.note_on_mono(event.note, event.velocity),
+                    PolyphonyMode::Poly => {
+                        let idx = self.pick_voice(event.note);
+                        let v = &mut self.voices[idx];
+                        v.uni_mul = 1.0;
+                        v.uni_gain = (1.0, 1.0);
+                        v.note_on(event.note, event.velocity, self.portamento, self.age_counter);
+                    }
                 }
             }
+            SynthEventKind::NoteOff => match self.polyphony {
+                PolyphonyMode::Mono => self.note_off_mono(event.note),
+                PolyphonyMode::Poly => {
+                    for v in &mut self.voices {
+                        v.note_off(event.note);
+                    }
+                }
+            },
             SynthEventKind::PitchBend(v) => self.pitch_bend = v,
             SynthEventKind::Aftertouch(v) => self.aftertouch = v,
             SynthEventKind::ControlChange { cc, value } => {
@@ -1738,5 +1900,96 @@ mod tests {
         assert!((e.voices[0].lfo.rate() - (140.0 / 60.0 / 0.25)).abs() < 1e-3);
         assert!((e.voices[0].lfo2.rate() - (140.0 / 60.0 / 2.0)).abs() < 1e-3);
         assert!((e.effects.delay_time() - (0.5 * 60.0 / 140.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn mono_key_stack_returns_to_previous_note() {
+        let mut e = engine();
+        e.set_polyphony_mode(PolyphonyMode::Mono);
+        e.receive_event(NoteEvent::note_on_midi(60, 100));
+        for _ in 0..64 {
+            e.next_sample_stereo();
+        }
+        e.receive_event(NoteEvent::note_on_midi(64, 100));
+        for _ in 0..64 {
+            e.next_sample_stereo();
+        }
+        assert!(e.voices[0].active && e.voices[0].note == 64);
+        // Releasing the top note falls back to the still-held 60.
+        e.receive_event(NoteEvent::note_off(64));
+        for _ in 0..64 {
+            e.next_sample_stereo();
+        }
+        assert!(e.voices[0].active);
+        assert_eq!(e.voices[0].note, 60);
+        assert_ne!(e.voices[0].amp_env.state(), EnvelopeState::Release);
+        // Releasing a non-top held note changes nothing audible.
+        e.receive_event(NoteEvent::note_on_midi(67, 100));
+        e.receive_event(NoteEvent::note_off(60));
+        for _ in 0..64 {
+            e.next_sample_stereo();
+        }
+        assert!(e.voices[0].active && e.voices[0].note == 67);
+        // Releasing the last note releases the voice.
+        e.receive_event(NoteEvent::note_off(67));
+        for _ in 0..44100 {
+            e.next_sample_stereo();
+        }
+        assert_eq!(e.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn mono_unison_stacks_detuned_voices() {
+        let mut e = engine();
+        e.set_polyphony_mode(PolyphonyMode::Mono);
+        e.set_unison_count(3);
+        e.set_unison_detune(24.0);
+        e.set_unison_spread(1.0);
+        e.receive_event(NoteEvent::note_on_midi(60, 100));
+        assert_eq!(e.active_voice_count(), 3);
+        assert!(e.voices[..3].iter().all(|v| v.note == 60));
+        // Symmetric detune: -24, 0, +24 cents.
+        let edge = 2.0f32.powf(24.0 / 1200.0);
+        assert!((e.voices[0].uni_mul - 1.0 / edge).abs() < 1e-4);
+        assert!((e.voices[1].uni_mul - 1.0).abs() < 1e-4);
+        assert!((e.voices[2].uni_mul - edge).abs() < 1e-4);
+        // Hard spread puts the edge voices fully L/R (with 1/sqrt(3) comp).
+        let comp = 3.0f32.sqrt().recip();
+        assert!((e.voices[0].uni_gain.1).abs() < 1e-6);
+        assert!((e.voices[0].uni_gain.0 - comp).abs() < 1e-4);
+        assert!((e.voices[2].uni_gain.0).abs() < 1e-6);
+        // Stack still returns to the previous held note across all voices.
+        e.receive_event(NoteEvent::note_on_midi(64, 90));
+        e.receive_event(NoteEvent::note_off(64));
+        for _ in 0..64 {
+            e.next_sample_stereo();
+        }
+        assert!(e.voices[..3].iter().all(|v| v.note == 60 && v.active));
+        e.receive_event(NoteEvent::note_off(60));
+        for _ in 0..44100 {
+            e.next_sample_stereo();
+        }
+        assert_eq!(e.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn unison_ignored_in_poly_and_mode_switch_releases() {
+        let mut e = engine(); // Poly
+        e.set_unison_count(4);
+        e.receive_event(NoteEvent::note_on_midi(60, 100));
+        assert_eq!(e.active_voice_count(), 1);
+        // Switching to mono releases held poly voices.
+        e.set_polyphony_mode(PolyphonyMode::Mono);
+        for _ in 0..44100 {
+            e.next_sample_stereo();
+        }
+        assert_eq!(e.active_voice_count(), 0);
+        // Idempotent: no release when the mode doesn't change.
+        e.receive_event(NoteEvent::note_on_midi(62, 100));
+        e.set_polyphony_mode(PolyphonyMode::Mono);
+        for _ in 0..64 {
+            e.next_sample_stereo();
+        }
+        assert_eq!(e.active_voice_count(), e.unison().0);
     }
 }
