@@ -58,14 +58,17 @@ const CLIP_GUARD: f32 = 0.90;
 /// at half rate (the window is twice as long then, so it still fits).
 const LA_ATTACK: f32 = 0.12;
 const LA_RELEASE: f32 = 0.0004;
-/// Slow auto-gain on the raw voice mix: program-level gain staging so the
-/// compressor/guard see sane material instead of doing all the work.
-/// Attenuates freely when the sum runs hot and adds up to +6 dB of makeup
-/// when the mix is quiet.
-const AGC_TARGET: f32 = 0.5;
-const AGC_ATTACK: f32 = 0.002; // ~11 ms @ 44.1 kHz
-const AGC_RELEASE: f32 = 0.00003; // ~750 ms @ 44.1 kHz
-const AGC_MAX_BOOST: f32 = 2.0;
+/// Feedforward gain staging on the raw voice mix: the per-voice peak bound
+/// (velocity × Σosc_level × 0.25 × unison) is known at note-on, before the
+/// envelope rises — so the mix is scaled to keep the *predicted* sum under
+/// STAGE_TARGET before a single hot sample reaches the FX/limiter chain.
+/// Quiet material gets up to STAGE_MAX_BOOST of makeup; the smoothing is
+/// asymmetric (fast tuck ~1 ms, slow boost ~200 ms) so note-on staging is
+/// instant while recovery never zippers.
+const STAGE_TARGET: f32 = 0.55;
+const STAGE_MAX_BOOST: f32 = 1.6;
+const STAGE_DOWN: f32 = 0.02;
+const STAGE_UP: f32 = 0.0008;
 
 /// Cycle-count a pipeline stage when a profiler hook is installed; a single
 /// predictable branch per call otherwise.
@@ -301,6 +304,10 @@ pub struct LeanVoice {
     glide_target: Frequency,
     gliding: bool,
     velocity: Amplitude,
+    /// Worst-case per-channel contribution: velocity × Σosc_level × 0.25 ×
+    /// uni_gain — refreshed at note-on and every control tick so the engine
+    /// can reserve headroom before envelopes rise.
+    peak_bound: f32,
     note: MidiNote,
     active: bool,
     age: u64,
@@ -360,6 +367,7 @@ impl LeanVoice {
             glide_target: 440.0,
             gliding: false,
             velocity: 0.0,
+            peak_bound: 0.0,
             note: 0,
             active: false,
             age: u64::MAX,
@@ -391,6 +399,10 @@ impl LeanVoice {
         // Gentle velocity curve (concave power) so max-velocity hits stay
         // punchy without jumping disproportionately in peak level.
         self.velocity = velocity.clamp(0.0, 1.0).sqrt();
+        self.peak_bound = self.velocity
+            * self.osc_level.iter().sum::<f32>()
+            * 0.25
+            * self.uni_gain.0.max(self.uni_gain.1);
         self.active = true;
         self.age = age;
         if portamento > 0.005 && was_active {
@@ -616,6 +628,15 @@ impl LeanVoice {
         self.filter_bypass = bypass;
 
         self.amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
+        // Refresh the headroom bound with live (mod-offset) levels — includes
+        // amp_lfo overshoot >1 so tremolo peaks are staged too.
+        self.peak_bound = self.velocity
+            * (0..MAX_OSCS)
+                .map(|i| (self.osc_level[i] + lvl_off[i]).clamp(0.0, 1.0))
+                .sum::<f32>()
+            * 0.25
+            * self.amp_lfo
+            * self.uni_gain.0.max(self.uni_gain.1);
     }
 
     #[link_section = ".iram1.text"]
@@ -754,10 +775,10 @@ pub struct EmbeddedEngine {
     la_q_head: usize,
     la_q_len: usize,
     la_gain: f32,
-    // Auto-gain staging on the raw voice mix — keeps program level near
-    // AGC_TARGET so comp/guard only ever see transients, not sustained heat.
-    agc_env: f32,
-    agc_gain: f32,
+    // Feedforward gain staging on the raw voice mix — smoothed attenuation
+    // derived from the predicted sum of per-voice peak bounds, so hot
+    // patches are scaled BEFORE the FX/limiter chain ever sees them.
+    stage_gain: f32,
     voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
     bpm: f32,             // tempo in BPM (20..300) for synced LFOs and delay
     lfo1_rate: f32,       // unsynced LFO1 rate in Hz
@@ -800,8 +821,7 @@ impl EmbeddedEngine {
             la_q_head: 0,
             la_q_len: 0,
             la_gain: 1.0,
-            agc_env: AGC_TARGET, // start neutral — no first-note boost surge
-            agc_gain: 1.0,
+            stage_gain: 1.0,
             voice_cap: max_voices,
             bpm: 120.0,
             lfo1_rate: 4.0,
@@ -1729,23 +1749,27 @@ impl EmbeddedEngine {
         let active_slots = &self.active_slots[..self.num_active_slots];
         let mut l = 0.0f32;
         let mut r = 0.0f32;
+        let mut bound = 0.0f32;
         for v in &mut self.voices {
             if v.active {
                 let s = v.next_stereo(bend_norm, bend_semi, mod_wheel, aftertouch, active_slots);
                 l += s.left;
                 r += s.right;
+                bound += v.peak_bound;
             }
         }
-        // Gain staging BEFORE the mix reaches the FX/limiter chain: a slow
-        // envelope tucks hot voice sums toward AGC_TARGET (attack ~11 ms,
-        // release ~750 ms — it moves like a hand on a fader, not a clamp)
-        // and returns up to +6 dB of makeup when the mix has headroom.
-        // Transients still pass through — the comp/guard below keep them.
-        let mp = l.abs().max(r.abs());
-        let ac = if mp > self.agc_env { AGC_ATTACK } else { AGC_RELEASE } * self.comp_rate_scale;
-        self.agc_env += ac * (mp - self.agc_env);
-        self.agc_gain = (AGC_TARGET / self.agc_env.max(0.05)).min(AGC_MAX_BOOST);
-        let mut out = StereoSample::new(l * self.agc_gain, r * self.agc_gain);
+        // Feedforward gain staging BEFORE the mix reaches the FX/limiter
+        // chain: `bound` is the predicted worst-case peak (velocity × osc
+        // levels × unison, refreshed per control tick), so the attenuation
+        // is already in place when a hot note's envelope starts rising —
+        // the comp/guard below then only deal with residue, not the bulk.
+        // Quiet material is lifted up to STAGE_MAX_BOOST; the tuck is fast
+        // (~1 ms, in place before the attack lands) and the boost is slow
+        // (~30 ms) so it breathes rather than zippers.
+        let target = (STAGE_TARGET / bound.max(0.05)).min(STAGE_MAX_BOOST);
+        let c = if target < self.stage_gain { STAGE_DOWN } else { STAGE_UP } * self.comp_rate_scale;
+        self.stage_gain += c * (target - self.stage_gain);
+        let mut out = StereoSample::new(l * self.stage_gain, r * self.stage_gain);
         if self.stereo_width != 1.0 {
             out = out.with_width(self.stereo_width);
         }
@@ -2099,23 +2123,23 @@ mod tests {
         }
         let mut worst = 0.0f32;
         let mut min_gain = 1.0f32;
-        let mut min_agc = 1.0f32;
+        let mut min_stage = 1.0f32;
         for _ in 0..44100 {
             let s = e.next_sample_stereo();
             worst = worst.max(s.left.abs()).max(s.right.abs());
             min_gain = min_gain.min(e.la_gain);
-            min_agc = min_agc.min(e.agc_gain);
+            min_stage = min_stage.min(e.stage_gain);
             assert!(
                 s.left.is_finite() && s.right.is_finite()
                     && s.left.abs() <= 1.0 && s.right.abs() <= 1.0,
                 "output escaped the clip guard: {s:?}"
             );
         }
-        // Hot material must be tamed by SOME stage — the AGC tucks the
-        // sustained sum, the guard catches whatever spikes past it.
+        // Hot material must be tamed by SOME stage — feedforward staging
+        // tucks the predicted sum, the guard catches whatever spikes past.
         assert!(
-            min_agc < 0.95 || min_gain < 0.95,
-            "no gain stage engaged (agc={min_agc} guard={min_gain})"
+            min_stage < 0.95 || min_gain < 0.95,
+            "no gain stage engaged (stage={min_stage} guard={min_gain})"
         );
         assert!(worst <= 0.95, "peak {worst} overshot the clip guard");
     }
