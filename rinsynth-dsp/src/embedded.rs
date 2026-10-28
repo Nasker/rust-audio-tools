@@ -45,6 +45,19 @@ const CONTROL_DIV: u32 = 64;
 const MAX_OSCS: usize = 4;
 /// Mono-mode key stack capacity (last-note priority, newest on top).
 const KEY_STACK_CAP: usize = 16;
+/// Clip-guard look-ahead: 128 internal frames (~2.9 ms @ 44.1 kHz,
+/// ~5.8 ms @ 22.05 kHz). Power of two — index by mask.
+const LOOKAHEAD: usize = 128;
+/// Output ceiling the look-ahead gain enforces. Below the `soft_clip`
+/// knee (0.75)? No — intentionally above: the guard is the brick wall,
+/// the final `soft_clip` only rounds the residual shoulder.
+const CLIP_GUARD: f32 = 0.90;
+/// Per-sample approach rates for the guard gain. Attack converges in
+/// ~50 samples — inside the 128-sample look-ahead so the gain is fully
+/// down before the peak exits the window. Scaled by `comp_rate_scale`
+/// at half rate (the window is twice as long then, so it still fits).
+const LA_ATTACK: f32 = 0.12;
+const LA_RELEASE: f32 = 0.0004;
 
 /// Cycle-count a pipeline stage when a profiler hook is installed; a single
 /// predictable branch per call otherwise.
@@ -722,6 +735,17 @@ pub struct EmbeddedEngine {
     stereo_width: f32,
     comp_env: f32,        // stereo bus compressor/limiter envelope follower
     comp_rate_scale: f32, // scales comp_env coefficients when rate != 44100
+    // Look-ahead clip guard: ring of post-FX samples + a monotonic
+    // descending max-queue so the window peak is known LOOKAHEAD frames
+    // before it reaches the output. `la_gain` therefore ramps down in
+    // time to brick-wall every transient instead of clipping after it.
+    la_ring: [StereoSample; LOOKAHEAD],
+    la_pos: usize,
+    la_counter: u32,
+    la_q: [(u32, f32); LOOKAHEAD], // (sequence, |peak|) descending values
+    la_q_head: usize,
+    la_q_len: usize,
+    la_gain: f32,
     voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
     bpm: f32,             // tempo in BPM (20..300) for synced LFOs and delay
     lfo1_rate: f32,       // unsynced LFO1 rate in Hz
@@ -757,6 +781,13 @@ impl EmbeddedEngine {
             stereo_width: 1.0,
             comp_env: 0.0,
             comp_rate_scale: 1.0,
+            la_ring: [StereoSample::ZERO; LOOKAHEAD],
+            la_pos: 0,
+            la_counter: 0,
+            la_q: [(0, 0.0); LOOKAHEAD],
+            la_q_head: 0,
+            la_q_len: 0,
+            la_gain: 1.0,
             voice_cap: max_voices,
             bpm: 120.0,
             lfo1_rate: 4.0,
@@ -1721,12 +1752,45 @@ impl EmbeddedEngine {
             out.right *= gain;
         }
 
+        // Look-ahead clip guard. The leveled signal enters a LOOKAHEAD-frame
+        // delay line; a descending max-queue tracks the window peak, so the
+        // needed gain is known before the peak reaches the output and
+        // `la_gain` converges while the transient is still in flight. Every
+        // peak therefore exits attenuated — the reactive compressor above
+        // can't overshoot into the clipper anymore.
+        let p = out.left.abs().max(out.right.abs());
+        while self.la_q_len > 0
+            && self.la_q[(self.la_q_head + self.la_q_len - 1) & (LOOKAHEAD - 1)].1 <= p
+        {
+            self.la_q_len -= 1;
+        }
+        self.la_q[(self.la_q_head + self.la_q_len) & (LOOKAHEAD - 1)] = (self.la_counter, p);
+        self.la_q_len += 1;
+        self.la_counter += 1;
+        if self.la_q_len > 0 && self.la_counter - self.la_q[self.la_q_head].0 > LOOKAHEAD as u32 {
+            self.la_q_head = (self.la_q_head + 1) & (LOOKAHEAD - 1);
+            self.la_q_len -= 1;
+        }
+        let delayed = self.la_ring[self.la_pos];
+        self.la_ring[self.la_pos] = out;
+        self.la_pos = (self.la_pos + 1) & (LOOKAHEAD - 1);
+        let win_peak = self.la_q[self.la_q_head].1;
+        let need = if win_peak > CLIP_GUARD { CLIP_GUARD / win_peak } else { 1.0 };
+        let rs = self.comp_rate_scale;
+        if need < self.la_gain {
+            self.la_gain += (need - self.la_gain) * LA_ATTACK * rs;
+        } else {
+            self.la_gain += (1.0 - self.la_gain) * LA_RELEASE * rs;
+        }
+        out.left = delayed.left * self.la_gain;
+        out.right = delayed.right * self.la_gain;
+
         StereoSample::new(soft_clip(out.left), soft_clip(out.right))
     }
 }
 
 #[inline]
-fn soft_clip(x: f32) -> f32 {
+pub fn soft_clip(x: f32) -> f32 {
     if x.abs() <= 0.75 {
         x
     } else {
@@ -1991,5 +2055,40 @@ mod tests {
             e.next_sample_stereo();
         }
         assert_eq!(e.active_voice_count(), e.unison().0);
+    }
+
+    #[test]
+    fn lookahead_guard_brickwalls_hot_transients() {
+        let mut e = engine();
+        // Hot patch: master at 1.0, all four oscs at full level, five
+        // max-velocity notes — raw mix peaks well above unity.
+        e.set_param(SynthParam::MasterVolume, 1.0);
+        for p in [
+            SynthParam::Osc1Level,
+            SynthParam::Osc2Level,
+            SynthParam::Osc3Level,
+            SynthParam::Osc4Level,
+        ] {
+            e.set_param(p, 1.0);
+        }
+        for n in [36u8, 48, 60, 64, 67] {
+            e.receive_event(NoteEvent::note_on_midi(n, 127));
+        }
+        let mut worst = 0.0f32;
+        let mut min_gain = 1.0f32;
+        for _ in 0..44100 {
+            let s = e.next_sample_stereo();
+            worst = worst.max(s.left.abs()).max(s.right.abs());
+            min_gain = min_gain.min(e.la_gain);
+            assert!(
+                s.left.is_finite() && s.right.is_finite()
+                    && s.left.abs() <= 1.0 && s.right.abs() <= 1.0,
+                "output escaped the clip guard: {s:?}"
+            );
+        }
+        // Material hot enough to need the guard must have engaged it, and
+        // the worst observed peak must sit below the guard ceiling.
+        assert!(min_gain < 0.95, "clip guard never engaged (min={min_gain})");
+        assert!(worst <= 0.95, "peak {worst} overshot the clip guard");
     }
 }
