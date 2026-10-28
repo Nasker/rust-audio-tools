@@ -58,6 +58,14 @@ const CLIP_GUARD: f32 = 0.90;
 /// at half rate (the window is twice as long then, so it still fits).
 const LA_ATTACK: f32 = 0.12;
 const LA_RELEASE: f32 = 0.0004;
+/// Slow auto-gain on the raw voice mix: program-level gain staging so the
+/// compressor/guard see sane material instead of doing all the work.
+/// Attenuates freely when the sum runs hot and adds up to +6 dB of makeup
+/// when the mix is quiet.
+const AGC_TARGET: f32 = 0.5;
+const AGC_ATTACK: f32 = 0.002; // ~11 ms @ 44.1 kHz
+const AGC_RELEASE: f32 = 0.00003; // ~750 ms @ 44.1 kHz
+const AGC_MAX_BOOST: f32 = 2.0;
 
 /// Cycle-count a pipeline stage when a profiler hook is installed; a single
 /// predictable branch per call otherwise.
@@ -746,6 +754,10 @@ pub struct EmbeddedEngine {
     la_q_head: usize,
     la_q_len: usize,
     la_gain: f32,
+    // Auto-gain staging on the raw voice mix — keeps program level near
+    // AGC_TARGET so comp/guard only ever see transients, not sustained heat.
+    agc_env: f32,
+    agc_gain: f32,
     voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
     bpm: f32,             // tempo in BPM (20..300) for synced LFOs and delay
     lfo1_rate: f32,       // unsynced LFO1 rate in Hz
@@ -788,6 +800,8 @@ impl EmbeddedEngine {
             la_q_head: 0,
             la_q_len: 0,
             la_gain: 1.0,
+            agc_env: AGC_TARGET, // start neutral — no first-note boost surge
+            agc_gain: 1.0,
             voice_cap: max_voices,
             bpm: 120.0,
             lfo1_rate: 4.0,
@@ -1722,7 +1736,16 @@ impl EmbeddedEngine {
                 r += s.right;
             }
         }
-        let mut out = StereoSample::new(l, r);
+        // Gain staging BEFORE the mix reaches the FX/limiter chain: a slow
+        // envelope tucks hot voice sums toward AGC_TARGET (attack ~11 ms,
+        // release ~750 ms — it moves like a hand on a fader, not a clamp)
+        // and returns up to +6 dB of makeup when the mix has headroom.
+        // Transients still pass through — the comp/guard below keep them.
+        let mp = l.abs().max(r.abs());
+        let ac = if mp > self.agc_env { AGC_ATTACK } else { AGC_RELEASE } * self.comp_rate_scale;
+        self.agc_env += ac * (mp - self.agc_env);
+        self.agc_gain = (AGC_TARGET / self.agc_env.max(0.05)).min(AGC_MAX_BOOST);
+        let mut out = StereoSample::new(l * self.agc_gain, r * self.agc_gain);
         if self.stereo_width != 1.0 {
             out = out.with_width(self.stereo_width);
         }
@@ -2076,19 +2099,24 @@ mod tests {
         }
         let mut worst = 0.0f32;
         let mut min_gain = 1.0f32;
+        let mut min_agc = 1.0f32;
         for _ in 0..44100 {
             let s = e.next_sample_stereo();
             worst = worst.max(s.left.abs()).max(s.right.abs());
             min_gain = min_gain.min(e.la_gain);
+            min_agc = min_agc.min(e.agc_gain);
             assert!(
                 s.left.is_finite() && s.right.is_finite()
                     && s.left.abs() <= 1.0 && s.right.abs() <= 1.0,
                 "output escaped the clip guard: {s:?}"
             );
         }
-        // Material hot enough to need the guard must have engaged it, and
-        // the worst observed peak must sit below the guard ceiling.
-        assert!(min_gain < 0.95, "clip guard never engaged (min={min_gain})");
+        // Hot material must be tamed by SOME stage — the AGC tucks the
+        // sustained sum, the guard catches whatever spikes past it.
+        assert!(
+            min_agc < 0.95 || min_gain < 0.95,
+            "no gain stage engaged (agc={min_agc} guard={min_gain})"
+        );
         assert!(worst <= 0.95, "peak {worst} overshot the clip guard");
     }
 }
