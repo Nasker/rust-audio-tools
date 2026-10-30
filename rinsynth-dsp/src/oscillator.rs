@@ -10,9 +10,12 @@ const SINE_LUT_SIZE: usize = 2048;
 
 fn sine_lut_table() -> &'static [f32; SINE_LUT_SIZE] {
     use std::sync::OnceLock;
-    static LUT: OnceLock<Box<[f32; SINE_LUT_SIZE]>> = OnceLock::new();
+    // Inline array, not a Box: the 8 KB table lives in .bss (internal SRAM
+    // on ESP32 — fast, off the PSRAM bus) instead of whichever heap the
+    // global allocator picks. OnceLock still defers the init cost.
+    static LUT: OnceLock<[f32; SINE_LUT_SIZE]> = OnceLock::new();
     LUT.get_or_init(|| {
-        let mut t = Box::new([0.0f32; SINE_LUT_SIZE]);
+        let mut t = [0.0f32; SINE_LUT_SIZE];
         for (i, v) in t.iter_mut().enumerate() {
             *v = (i as f32 * 2.0 * PI / SINE_LUT_SIZE as f32).sin();
         }

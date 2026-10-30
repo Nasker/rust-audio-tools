@@ -333,6 +333,10 @@ pub struct LeanVoice {
     /// counts when Osc4 is routed as an FM/RM source). Replaces the
     /// 4-6 float compares per osc per sample with one bit test.
     osc_live: u8,
+    /// Any gain step currently nonzero — the per-sample ramp adds and the
+    /// gains write-back are skipped entirely once every target has been
+    /// reached (steps snap to exact 0.0, so this actually releases).
+    ramping: bool,
     /// Whether the filter envelope output is consumed anywhere — nonzero
     /// fenv_amount or a matrix slot sourcing FilterEnv. Lets `next_stereo`
     /// skip the per-sample fenv tick on patches that never read it.
@@ -404,6 +408,7 @@ impl LeanVoice {
             last_fmode: FilterMode::HighPass,
             last_ffs: 0,
             osc_live: 0,
+            ramping: false,
             fenv_used: true,
             sample_rate,
         }
@@ -461,6 +466,7 @@ impl LeanVoice {
             self.amp_lfo = 1.0;
             self.amp_lfo_step = 0.0;
             self.osc_live = 0xF;
+            self.ramping = false;
             self.fenv_used = true;
             self.smooth_cutoff = self.base_cutoff;
             self.amp_env.reset();
@@ -652,12 +658,25 @@ impl LeanVoice {
         // Compute per-sample linear ramp increments across the next 64 samples
         // (with a 0.45 one-pole slew filter so even Square/Saw LFO edges glide
         // over ~3 ms instead of snapping, and Sine/Tri LFOs on Pan/Level never
-        // produce 689 Hz control-rate staircase "shizzle").
+        // produce 689 Hz control-rate staircase "shizzle"). Snap to the
+        // target once close enough — the asymptotic slew never reaches
+        // exact equality on its own, and exact-0 steps are what lets
+        // `ramping` release so the per-sample adds stop running.
         for i in 0..MAX_OSCS {
-            let dl = 0.45 * (self.target_gains[i].0 - self.gains[i].0);
-            let dr = 0.45 * (self.target_gains[i].1 - self.gains[i].1);
-            self.gain_steps[i] = (dl * INV_CONTROL_DIV, dr * INV_CONTROL_DIV);
+            let dl = self.target_gains[i].0 - self.gains[i].0;
+            let dr = self.target_gains[i].1 - self.gains[i].1;
+            if dl.abs() < 1e-4 && dr.abs() < 1e-4 {
+                self.gains[i] = self.target_gains[i];
+                self.gain_steps[i] = (0.0, 0.0);
+            } else {
+                self.gain_steps[i] =
+                    (0.45 * dl * INV_CONTROL_DIV, 0.45 * dr * INV_CONTROL_DIV);
+            }
         }
+        self.ramping = self
+            .gain_steps
+            .iter()
+            .any(|s| s.0 != 0.0 || s.1 != 0.0);
         if pw_dirty {
             for i in 0..MAX_OSCS {
                 self.oscs[i].set_duty(self.osc_pw[i] + pw_off[i]);
@@ -725,7 +744,13 @@ impl LeanVoice {
         self.filter_bypass = bypass;
 
         let target_amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
-        self.amp_lfo_step = 0.45 * (target_amp_lfo - self.amp_lfo) * INV_CONTROL_DIV;
+        let d_amp = target_amp_lfo - self.amp_lfo;
+        if d_amp.abs() < 1e-4 {
+            self.amp_lfo = target_amp_lfo;
+            self.amp_lfo_step = 0.0;
+        } else {
+            self.amp_lfo_step = 0.45 * d_amp * INV_CONTROL_DIV;
+        }
 
         // Per-tick activity bookkeeping for the per-sample path.
         self.fenv_used = self.fenv_amount != 0.0
@@ -788,17 +813,20 @@ impl LeanVoice {
         let mut l = 0.0f32;
         let mut r = 0.0f32;
         let _osct = profile::now();
-        // Hoist gains/steps to locals — self.oscs[i].next() borrows &mut
-        // self, which would otherwise force a load/store round-trip on the
-        // gain fields every iteration. osc_live (recomputed each tick)
-        // replaces the per-sample compare chains with one bit test.
+        // Hoist gains to locals — self.oscs[i].next() borrows &mut self,
+        // which would otherwise force a load/store round-trip on the gain
+        // fields every iteration. The step adds + write-back only run while
+        // a target is still being ramped toward (`ramping`, set each tick);
+        // once settled the locals are read-only and never written back.
+        let ramping = self.ramping;
         let mut gains = self.gains;
-        let steps = self.gain_steps;
         // Advance Osc 4 first when active (either audible or routed as an
         // audio-rate FM / Ring-Mod source in the mod matrix).
         let s4 = if self.osc_live & 8 != 0 {
-            gains[3].0 += steps[3].0;
-            gains[3].1 += steps[3].1;
+            if ramping {
+                gains[3].0 += self.gain_steps[3].0;
+                gains[3].1 += self.gain_steps[3].1;
+            }
             let v = self.oscs[3].next();
             l += v * gains[3].0;
             r += v * gains[3].1;
@@ -822,15 +850,19 @@ impl LeanVoice {
         };
         for i in 0..3 {
             if self.osc_live & (1 << i) != 0 {
-                gains[i].0 += steps[i].0;
-                gains[i].1 += steps[i].1;
+                if ramping {
+                    gains[i].0 += self.gain_steps[i].0;
+                    gains[i].1 += self.gain_steps[i].1;
+                }
                 let s = self.oscs[i].next();
                 let m = if i == 0 { rm_gain } else { 1.0 };
                 l += s * gains[i].0 * m;
                 r += s * gains[i].1 * m;
             }
         }
-        self.gains = gains;
+        if ramping {
+            self.gains = gains;
+        }
         if profile::enabled() {
             profile::add(profile::OSC, profile::now() - _osct);
         }
