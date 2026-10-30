@@ -366,6 +366,23 @@ pub struct LeanVoice {
     uni_gain: (f32, f32),
     uni_gain_step: (f32, f32),
     target_uni_gain: (f32, f32),
+    /// Bitmask of oscillators that may emit audio this control block
+    /// (bit i = osc i renders) — recomputed each control tick so the
+    /// per-sample osc gate is a single bit test.
+    osc_live: u8,
+    /// Any ramp steps currently nonzero — when false, the per-sample
+    /// gain/amp/fm/rm additions are exact no-ops and get skipped wholesale.
+    ramping: bool,
+    /// Any waveform dip in progress or pending — skips the fade mul + state
+    /// machine on the (overwhelmingly common) steady-state path.
+    wf_fading: bool,
+    /// Last inputs pushed into `filter.set` — the powf/sin_cos/divide chain
+    /// is skipped while all three hold still (see control_tick).
+    last_oct: f32,
+    last_reso: f32,
+    /// Effective cutoff from the last `filter.set` — reused by the bypass
+    /// evaluation on ticks where coefficients aren't recomputed.
+    last_cutoff: Frequency,
     sample_rate: SampleRate,
 }
 
@@ -438,6 +455,12 @@ impl LeanVoice {
             uni_gain: (1.0, 1.0),
             uni_gain_step: (0.0, 0.0),
             target_uni_gain: (1.0, 1.0),
+            osc_live: 0,
+            ramping: false,
+            wf_fading: false,
+            last_oct: 1e30,
+            last_reso: 1e30,
+            last_cutoff: 20000.0,
             sample_rate,
         }
     }
@@ -475,6 +498,7 @@ impl LeanVoice {
     fn set_osc_waveform(&mut self, i: usize, wf: WaveformType) {
         if self.active && self.oscs[i].kind != wf {
             self.wf_pending[i] = wf as u8;
+            self.wf_fading = true;
         } else {
             self.oscs[i].kind = wf;
         }
@@ -537,6 +561,19 @@ impl LeanVoice {
             self.osc4_rm = self.target_osc4_rm;
             self.osc4_fm_step = 0.0;
             self.osc4_rm_step = 0.0;
+            self.ramping = false;
+            self.last_oct = 1e30;
+            self.last_reso = 1e30;
+            let mut live = 0u8;
+            for i in 0..MAX_OSCS {
+                if self.target_gains[i].0 > 0.0 || self.target_gains[i].1 > 0.0 {
+                    live |= 1 << i;
+                }
+            }
+            if self.osc4_fm != 0.0 || self.osc4_rm != 0.0 {
+                live |= 1 << 3;
+            }
+            self.osc_live = live;
             self.wf_fade = [1.0; MAX_OSCS];
             for i in 0..MAX_OSCS {
                 if self.wf_pending[i] != 0xFF {
@@ -707,6 +744,8 @@ impl LeanVoice {
         // (with a 0.45 one-pole slew filter so even Square/Saw LFO edges glide
         // over ~3 ms instead of snapping, and Sine/Tri LFOs on Pan/Level never
         // produce 689 Hz control-rate staircase "shizzle").
+        let mut pw_dirty = false;
+        let mut detune_dirty = false;
         for i in 0..MAX_OSCS {
             let dl = 0.45 * (self.target_gains[i].0 - self.gains[i].0);
             let dr = 0.45 * (self.target_gains[i].1 - self.gains[i].1);
@@ -716,10 +755,21 @@ impl LeanVoice {
             // control ticks so slider drags and PWM never click.
             let target_pw = (self.osc_pw[i] + pw_off[i]).clamp(0.01, 0.99);
             self.smooth_pw[i] += 0.25 * (target_pw - self.smooth_pw[i]);
-            self.oscs[i].set_duty(self.smooth_pw[i]);
+            if (target_pw - self.smooth_pw[i]).abs() > 1e-6 {
+                pw_dirty = true;
+            }
             self.detune[i] += 0.25 * (self.target_detune[i] - self.detune[i]);
+            if (self.target_detune[i] - self.detune[i]).abs() > 1e-7 {
+                detune_dirty = true;
+            }
+        }
+        if pw_dirty {
+            for i in 0..MAX_OSCS {
+                self.oscs[i].set_duty(self.smooth_pw[i]);
+            }
         }
         self.uni_mul += 0.25 * (self.target_uni_mul - self.uni_mul);
+        let uni_dirty = (self.target_uni_mul - self.uni_mul).abs() > 1e-7;
         let udl = 0.45 * (self.target_uni_gain.0 - self.uni_gain.0);
         let udr = 0.45 * (self.target_uni_gain.1 - self.uni_gain.1);
         self.uni_gain_step = (udl * INV_CONTROL_DIV, udr * INV_CONTROL_DIV);
@@ -730,11 +780,41 @@ impl LeanVoice {
 
         // Smooth pitch offsets (bend + LFO/matrix pitch) at ~0.5 pole per
         // tick: pitch bend and vibrato stay clean while tracking stays fast.
-        self.smooth_pitch += 0.5 * ((bend_semitones + all_pitch_semi) - self.smooth_pitch);
+        let target_pitch = bend_semitones + all_pitch_semi;
+        self.smooth_pitch += 0.5 * (target_pitch - self.smooth_pitch);
+        let mut pitch_dirty = (target_pitch - self.smooth_pitch).abs() > 1e-7;
         for i in 0..MAX_OSCS {
             self.smooth_osc_pitch[i] += 0.5 * (osc_pitch_semi[i] - self.smooth_osc_pitch[i]);
+            if (osc_pitch_semi[i] - self.smooth_osc_pitch[i]).abs() > 1e-7 {
+                pitch_dirty = true;
+            }
         }
-        self.set_osc_freqs(self.smooth_pitch, self.smooth_osc_pitch);
+        // Only pay for the powf/divides in set_osc_freqs while a pitch input
+        // is actually moving — sustained notes re-derive identical incs.
+        if pitch_dirty || detune_dirty || uni_dirty {
+            self.set_osc_freqs(self.smooth_pitch, self.smooth_osc_pitch);
+        }
+        // Bitmask of oscillators that may emit audio next block — one bit
+        // test per osc per sample instead of re-reading all the gain fields.
+        let mut live = 0u8;
+        for i in 0..MAX_OSCS {
+            if self.gains[i].0 > 1e-6
+                || self.gains[i].1 > 1e-6
+                || self.target_gains[i].0 > 0.0
+                || self.target_gains[i].1 > 0.0
+                || self.wf_pending[i] != 0xFF
+            {
+                live |= 1 << i;
+            }
+        }
+        if self.osc4_fm != 0.0
+            || self.osc4_rm != 0.0
+            || self.target_osc4_fm != 0.0
+            || self.target_osc4_rm != 0.0
+        {
+            live |= 1 << 3;
+        }
+        self.osc_live = live;
 
         // Smooth base_cutoff, cutoff modulation, and resonance at control rate
         // to prevent staircase clicks when sweeping filter sliders/knobs.
@@ -744,12 +824,24 @@ impl LeanVoice {
         self.smooth_fenv_amt += 0.25 * (self.fenv_amount - self.smooth_fenv_amt);
         let env_sweep = 6.0 * self.smooth_fenv_amt * self.fenv_amp;
         self.smooth_cutoff_oct += 0.35 * (cutoff_oct - self.smooth_cutoff_oct);
-        let cutoff = (self.smooth_cutoff * 2.0f32.powf(env_sweep + self.smooth_cutoff_oct))
-            .clamp(25.0, self.sample_rate as f32 * 0.42);
         let eff_reso = (self.resonance + reso_off).clamp(0.0, 1.0);
         self.smooth_reso += 0.22 * (eff_reso - self.smooth_reso);
-        self.filter
-            .set(self.filter_mode, cutoff, self.smooth_reso, self.sample_rate);
+        // Only pay for the powf + sin_cos + divides in filter.set while a
+        // coefficient input is actually moving (or the mode changed) —
+        // sustained notes re-derive identical coefficients otherwise.
+        let oct_total = env_sweep + self.smooth_cutoff_oct;
+        if (oct_total - self.last_oct).abs() > 1e-7
+            || (self.smooth_reso - self.last_reso).abs() > 1e-7
+            || self.filter.mode != self.filter_mode
+        {
+            self.last_oct = oct_total;
+            self.last_reso = self.smooth_reso;
+            let cutoff = (self.smooth_cutoff * 2.0f32.powf(oct_total))
+                .clamp(25.0, self.sample_rate as f32 * 0.42);
+            self.last_cutoff = cutoff;
+            self.filter
+                .set(self.filter_mode, cutoff, self.smooth_reso, self.sample_rate);
+        }
         // Bypass the per-sample SVF when it would be a no-op audibly:
         // lowpass, cutoff pinned at the top clamp, ~no resonance — AND no
         // modulator currently able to pull it back down. apply_preset
@@ -768,7 +860,7 @@ impl LeanVoice {
             });
         let bypass = self.filter_mode == FilterMode::LowPass
             && self.smooth_reso < 0.01
-            && cutoff >= self.sample_rate as f32 * 0.42 * 0.999
+            && self.last_cutoff >= self.sample_rate as f32 * 0.42 * 0.999
             && self.filter.xfade == 0
             && !filter_modulated;
         if self.filter_bypass && !bypass {
@@ -778,6 +870,17 @@ impl LeanVoice {
 
         let target_amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
         self.amp_lfo_step = 0.45 * (target_amp_lfo - self.amp_lfo) * INV_CONTROL_DIV;
+
+        // Per-sample fast-path flags: with all steps converged the ramp adds
+        // are exact no-ops, so the hot loop can skip them and their write-back.
+        self.ramping = self.gain_steps.iter().any(|s| s.0 != 0.0 || s.1 != 0.0)
+            || self.uni_gain_step.0 != 0.0
+            || self.uni_gain_step.1 != 0.0
+            || self.osc4_fm_step != 0.0
+            || self.osc4_rm_step != 0.0
+            || self.amp_lfo_step != 0.0;
+        self.wf_fading = self.wf_fade.iter().any(|f| *f < 1.0)
+            || self.wf_pending.iter().any(|p| *p != 0xFF);
     }
 
     #[link_section = ".iram1.text"]
@@ -823,23 +926,38 @@ impl LeanVoice {
         let mut l = 0.0f32;
         let mut r = 0.0f32;
         let _osct = profile::now();
-        self.osc4_fm += self.osc4_fm_step;
-        self.osc4_rm += self.osc4_rm_step;
+        // Hoist per-sample ramp state into locals: the `&mut oscs[i]` borrows
+        // in the loop otherwise force a load+store round-trip on every gain
+        // field every sample. `osc_live` is a bitmask refreshed at each
+        // control tick — one bit test per osc instead of a 5-way OR over
+        // gain/pending fields. When `ramping` is false all steps are exact
+        // zeros and the adds/write-back are skipped wholesale.
+        let live = self.osc_live;
+        let fading = self.wf_fading;
+        let mut gs = self.gains;
+        if self.ramping {
+            let st = self.gain_steps;
+            for i in 0..MAX_OSCS {
+                gs[i].0 += st[i].0;
+                gs[i].1 += st[i].1;
+            }
+            self.gains = gs;
+            self.osc4_fm += self.osc4_fm_step;
+            self.osc4_rm += self.osc4_rm_step;
+            self.amp_lfo += self.amp_lfo_step;
+            self.uni_gain.0 += self.uni_gain_step.0;
+            self.uni_gain.1 += self.uni_gain_step.1;
+        }
         // Advance Osc 4 first when active (either audible or routed as an
         // audio-rate FM / Ring-Mod source in the mod matrix).
-        let s4 = if self.gains[3].0 > 1e-6
-            || self.gains[3].1 > 1e-6
-            || self.target_gains[3].0 > 0.0
-            || self.target_gains[3].1 > 0.0
-            || self.osc4_fm != 0.0
-            || self.osc4_rm != 0.0
-        {
-            self.gains[3].0 += self.gain_steps[3].0;
-            self.gains[3].1 += self.gain_steps[3].1;
-            let v = self.oscs[3].next() * self.wf_fade[3];
-            self.step_wf_fade(3);
-            l += v * self.gains[3].0;
-            r += v * self.gains[3].1;
+        let s4 = if live & (1 << 3) != 0 {
+            let mut v = self.oscs[3].next();
+            if fading {
+                v *= self.wf_fade[3];
+                self.step_wf_fade(3);
+            }
+            l += v * gs[3].0;
+            r += v * gs[3].1;
             if self.osc4_fm != 0.0 {
                 let mut p = self.oscs[0].phase + v * self.osc4_fm * self.oscs[0].inc * 4.0;
                 if p >= 1.0 {
@@ -859,19 +977,15 @@ impl LeanVoice {
             1.0
         };
         for i in 0..3 {
-            if self.gains[i].0 > 1e-6
-                || self.gains[i].1 > 1e-6
-                || self.target_gains[i].0 > 0.0
-                || self.target_gains[i].1 > 0.0
-                || self.wf_pending[i] != 0xFF
-            {
-                self.gains[i].0 += self.gain_steps[i].0;
-                self.gains[i].1 += self.gain_steps[i].1;
-                let s = self.oscs[i].next() * self.wf_fade[i];
-                self.step_wf_fade(i);
+            if live & (1 << i) != 0 {
+                let mut s = self.oscs[i].next();
+                if fading {
+                    s *= self.wf_fade[i];
+                    self.step_wf_fade(i);
+                }
                 let m = if i == 0 { rm_gain } else { 1.0 };
-                l += s * self.gains[i].0 * m;
-                r += s * self.gains[i].1 * m;
+                l += s * gs[i].0 * m;
+                r += s * gs[i].1 * m;
             }
         }
         if profile::enabled() {
@@ -887,9 +1001,6 @@ impl LeanVoice {
         if profile::enabled() {
             profile::add(profile::FILTER, profile::now() - _ft);
         }
-        self.amp_lfo += self.amp_lfo_step;
-        self.uni_gain.0 += self.uni_gain_step.0;
-        self.uni_gain.1 += self.uni_gain_step.1;
         let g = amp * self.velocity * self.amp_lfo;
         StereoSample::new(fl * g * self.uni_gain.0, fr * g * self.uni_gain.1)
     }
@@ -1953,8 +2064,14 @@ impl EmbeddedEngine {
         }
         let mut out = StereoSample::new(l, r);
         // Per-sample one-pole on stereo width — a stepped mid/side gain is an
-        // output discontinuity just like any other level jump.
-        self.smooth_width += 0.002 * (self.stereo_width - self.smooth_width);
+        // output discontinuity just like any other level jump. Snaps on
+        // converge so the compare-guard skips the update in steady state.
+        if self.smooth_width != self.stereo_width {
+            self.smooth_width += 0.002 * (self.stereo_width - self.smooth_width);
+            if (self.stereo_width - self.smooth_width).abs() < 1e-5 {
+                self.smooth_width = self.stereo_width;
+            }
+        }
         if (self.smooth_width - 1.0).abs() > 1e-4 {
             out = out.with_width(self.smooth_width);
         }
@@ -1962,7 +2079,12 @@ impl EmbeddedEngine {
         // with an audio-taper makeup curve: 0.0 -> 0.0, 0.5 -> 0.56, 0.7 -> 0.89,
         // 1.0 -> 1.50 (+3.5 dB post-FX digital makeup gain before the DAC).
         let target_vol = Self::master_taper(self.master_volume);
-        self.smooth_master_gain += 0.0015 * (target_vol - self.smooth_master_gain);
+        if self.smooth_master_gain != target_vol {
+            self.smooth_master_gain += 0.0015 * (target_vol - self.smooth_master_gain);
+            if (target_vol - self.smooth_master_gain).abs() < 1e-5 {
+                self.smooth_master_gain = target_vol;
+            }
+        }
 
         if profile::enabled() {
             profile::add(profile::SAMPLES, 1);
