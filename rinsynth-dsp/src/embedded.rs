@@ -374,10 +374,26 @@ impl LeanVoice {
         }
     }
 
+    #[inline]
+    fn osc_level_gain(kind: WaveformType, level: f32) -> f32 {
+        let x = level.clamp(0.0, 1.0);
+        match kind {
+            // Broadband white noise has high energy in the ear's 2–5 kHz
+            // sensitivity band: use a quadratic audio taper (x^2) so the bottom
+            // 15% of the slider gives fine "air"/breath control (-84 dB..-36 dB)
+            // while full throw (1.0) reaches 0.65 * OSC_GAIN (equal-loudness
+            // matched to a full-level Saw/Square wave).
+            WaveformType::Noise => x * x * 0.65 * OSC_GAIN,
+            // Gentle audio taper on pitched oscillators: fine control on subtle
+            // sub/harmonic layers near the bottom, full 1.0 * OSC_GAIN at 1.0.
+            _ => x * (0.4 + 0.6 * x) * OSC_GAIN,
+        }
+    }
+
     fn update_gains(&mut self) {
         for i in 0..MAX_OSCS {
             let (pl, pr) = pan_gains(self.osc_pan[i]);
-            let lvl = self.osc_level[i] * OSC_GAIN;
+            let lvl = Self::osc_level_gain(self.oscs[i].kind, self.osc_level[i]);
             self.target_gains[i] = (lvl * pl, lvl * pr);
             if !self.active {
                 self.gains[i] = self.target_gains[i];
@@ -575,7 +591,7 @@ impl LeanVoice {
         if gains_dirty {
             for i in 0..MAX_OSCS {
                 let (pl, pr) = pan_gains(self.osc_pan[i] + pan_off[i]);
-                let lvl = (self.osc_level[i] + lvl_off[i]).clamp(0.0, 1.0) * OSC_GAIN;
+                let lvl = Self::osc_level_gain(self.oscs[i].kind, self.osc_level[i] + lvl_off[i]);
                 self.target_gains[i] = (lvl * pl, lvl * pr);
             }
         }
@@ -1468,6 +1484,7 @@ impl EmbeddedEngine {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
                     v.oscs[0].kind = wf;
+                    v.update_gains();
                 }
             }
             SynthParam::Osc1Level => {
@@ -1493,6 +1510,7 @@ impl EmbeddedEngine {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
                     v.oscs[1].kind = wf;
+                    v.update_gains();
                 }
             }
             SynthParam::Osc2Level => {
@@ -1532,6 +1550,7 @@ impl EmbeddedEngine {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
                     v.oscs[2].kind = wf;
+                    v.update_gains();
                 }
             }
             SynthParam::Osc3Level => {
@@ -1571,6 +1590,7 @@ impl EmbeddedEngine {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
                     v.oscs[3].kind = wf;
+                    v.update_gains();
                 }
             }
             SynthParam::Osc4Level => {
@@ -2178,5 +2198,17 @@ mod tests {
         // a 64-sample staircase jump.
         assert!(max_dg < 0.002, "pan gain stepped too abruptly: max_dg={max_dg}");
         assert!(max_damp < 0.015, "amp_lfo stepped too abruptly: max_damp={max_damp}");
+    }
+
+    #[test]
+    fn noise_oscillator_taper_gives_subtle_low_end_and_strong_max() {
+        let low_noise = LeanVoice::osc_level_gain(WaveformType::Noise, 0.05);
+        let low_saw = LeanVoice::osc_level_gain(WaveformType::Saw, 0.05);
+        let max_noise = LeanVoice::osc_level_gain(WaveformType::Noise, 1.0);
+        let max_saw = LeanVoice::osc_level_gain(WaveformType::Saw, 1.0);
+        // At 0.05 ("air" region), noise must be >10x quieter than a pitched osc
+        assert!(low_noise * 10.0 < low_saw, "low_noise={low_noise}, low_saw={low_saw}");
+        // At 1.0, noise still reaches 65% of full oscillator scale
+        assert!((max_noise - max_saw * 0.65).abs() < 1e-6);
     }
 }
