@@ -43,10 +43,11 @@ use std::f32::consts::PI;
 /// Samples between control-rate updates (LFO tick, mod matrix, filter coeffs).
 const CONTROL_DIV: u32 = 64;
 const MAX_OSCS: usize = 4;
-/// Per-oscillator static gain staging (~-7 dB below the old 0.25 single-voice
-/// scale). Budgets clean linear headroom for 4–5 polyphonic voices with
-/// multiple active oscillators at MasterVolume = 1.0 without dynamic ducking.
-const OSC_GAIN: f32 = 0.11;
+/// Per-oscillator static gain staging (~-9.3 dB below the old 0.25 single-voice
+/// scale). Leaves generous internal headroom for resonant low-frequency filters
+/// and polyphonic chords; the post-FX Master Volume stage provides up to +3.5 dB
+/// (1.5x) of clean digital makeup gain at the top of the throw.
+const OSC_GAIN: f32 = 0.085;
 /// Mono-mode key stack capacity (last-note priority, newest on top).
 const KEY_STACK_CAP: usize = 16;
 
@@ -209,9 +210,9 @@ impl TptSvf {
         self.a2 = a2;
         self.a3 = a3;
         self.k = k;
-        // Moderate input headroom compensation at high Q so passband stays
-        // full while high-velocity resonant peaks stay controlled.
-        self.in_gain = 1.0 / (1.0 + 0.35 * r * r);
+        // Input headroom compensation at high Q so low-frequency fundamentals
+        // hitting the resonant peak don't overdrive the voice budget.
+        self.in_gain = 1.0 / (1.0 + 1.1 * r * r);
         self.mode = mode;
     }
 
@@ -224,12 +225,15 @@ impl TptSvf {
         let v2 = self.ic2[ch] + self.a2 * self.ic1[ch] + self.a3 * v3;
         let mut ic1 = 2.0 * v1 - self.ic1[ch];
         let ic2 = 2.0 * v2 - self.ic2[ch];
-        // Smooth division-free cubic saturation on the bandpass resonator state
-        // starting at 0.60 (caps peak around ±0.90) so high Q self-oscillates
-        // warmly without harsh clipping on high-velocity strikes.
-        if ic1.abs() > 0.60 {
-            let c = ic1.clamp(-1.35, 1.35);
-            ic1 = c * (1.0 - 0.18 * c * c);
+        // C1-continuous division-free cubic soft saturation on the bandpass
+        // resonator state above 0.24 (asymptotes cleanly to ±0.40). Eliminates
+        // the old step discontinuity at 0.60 and keeps low-frequency resonant
+        // peaks inside the per-voice headroom budget.
+        let abs_ic1 = ic1.abs();
+        if abs_ic1 > 0.24 {
+            let u = ((abs_ic1 - 0.24) * 4.166_666_5).min(1.0);
+            let sat = 0.24 + 0.24 * u * (1.0 - 0.333_333_34 * u * u);
+            ic1 = ic1.signum() * sat;
         }
         self.ic1[ch] = ic1;
         self.ic2[ch] = ic2;
@@ -252,8 +256,10 @@ fn pan_gains(pan: f32) -> (f32, f32) {
 
 pub struct LeanVoice {
     oscs: [LeanOsc; MAX_OSCS],
-    /// (level × OSC_GAIN × panL, level × OSC_GAIN × panR) per osc
+    /// Smoothed (level × OSC_GAIN × panL, level × OSC_GAIN × panR) per osc
     gains: [(f32, f32); MAX_OSCS],
+    /// Target per-oscillator stereo gains (smoothed toward in `control_tick`)
+    target_gains: [(f32, f32); MAX_OSCS],
     osc_level: [f32; MAX_OSCS],
     osc_pan: [f32; MAX_OSCS],
     osc_pw: [f32; MAX_OSCS],
@@ -274,6 +280,7 @@ pub struct LeanVoice {
     filter_bypass: bool,
     resonance: f32, // 0.0..1.0
     base_cutoff: Frequency,
+    smooth_cutoff: Frequency,
     lfo: LFO,
     lfo2: LFO,
     lfo_rate: f32,
@@ -317,6 +324,7 @@ impl LeanVoice {
                 LeanOsc::new(WaveformType::Sine),
             ],
             gains: [(0.0, 0.0); MAX_OSCS],
+            target_gains: [(0.0, 0.0); MAX_OSCS],
             osc_level: [0.0; MAX_OSCS],
             osc_pan: [0.0; MAX_OSCS],
             osc_pw: [0.5; MAX_OSCS],
@@ -333,6 +341,7 @@ impl LeanVoice {
             filter_bypass: false,
             resonance: 0.2,
             base_cutoff: 8000.0,
+            smooth_cutoff: 8000.0,
             lfo: LFO::new(ctrl_sr),
             lfo2: LFO::new(ctrl_sr),
             lfo_rate: 4.0,
@@ -363,7 +372,10 @@ impl LeanVoice {
         for i in 0..MAX_OSCS {
             let (pl, pr) = pan_gains(self.osc_pan[i]);
             let lvl = self.osc_level[i] * OSC_GAIN;
-            self.gains[i] = (lvl * pl, lvl * pr);
+            self.target_gains[i] = (lvl * pl, lvl * pr);
+            if !self.active {
+                self.gains[i] = self.target_gains[i];
+            }
         }
     }
 
@@ -387,6 +399,8 @@ impl LeanVoice {
             }
         }
         if !was_active {
+            self.gains = self.target_gains;
+            self.smooth_cutoff = self.base_cutoff;
             self.amp_env.reset();
             self.fenv.reset();
             self.env3.reset();
@@ -553,8 +567,13 @@ impl LeanVoice {
             for i in 0..MAX_OSCS {
                 let (pl, pr) = pan_gains(self.osc_pan[i] + pan_off[i]);
                 let lvl = (self.osc_level[i] + lvl_off[i]).clamp(0.0, 1.0) * OSC_GAIN;
-                self.gains[i] = (lvl * pl, lvl * pr);
+                self.target_gains[i] = (lvl * pl, lvl * pr);
             }
+        }
+        // De-zipper oscillator gains across control ticks (~8 ms glide).
+        for i in 0..MAX_OSCS {
+            self.gains[i].0 += 0.18 * (self.target_gains[i].0 - self.gains[i].0);
+            self.gains[i].1 += 0.18 * (self.target_gains[i].1 - self.gains[i].1);
         }
         if pw_dirty {
             for i in 0..MAX_OSCS {
@@ -564,9 +583,12 @@ impl LeanVoice {
 
         self.set_osc_freqs(bend_semitones + all_pitch_semi, osc_pitch_semi);
 
+        // Smooth base_cutoff at control rate to prevent staircase clicks when
+        // sweeping the cutoff slider/knob.
+        self.smooth_cutoff += 0.22 * (self.base_cutoff - self.smooth_cutoff);
         // Filter env: 6-octave sweep at full amount (matches the rich engine)
         let env_sweep = 6.0 * self.fenv_amount * self.fenv_amp;
-        let cutoff = (self.base_cutoff * 2.0f32.powf(env_sweep + cutoff_oct))
+        let cutoff = (self.smooth_cutoff * 2.0f32.powf(env_sweep + cutoff_oct))
             .clamp(25.0, self.sample_rate as f32 * 0.42);
         let eff_reso = (self.resonance + reso_off).clamp(0.0, 1.0);
         self.filter
@@ -644,8 +666,10 @@ impl LeanVoice {
         let _osct = profile::now();
         // Advance Osc 4 first when active (either audible or routed as an
         // audio-rate FM / Ring-Mod source in the mod matrix).
-        let s4 = if self.gains[3].0 > 0.0
-            || self.gains[3].1 > 0.0
+        let s4 = if self.gains[3].0 > 1e-6
+            || self.gains[3].1 > 1e-6
+            || self.target_gains[3].0 > 0.0
+            || self.target_gains[3].1 > 0.0
             || self.osc4_fm != 0.0
             || self.osc4_rm != 0.0
         {
@@ -671,7 +695,11 @@ impl LeanVoice {
             1.0
         };
         for i in 0..3 {
-            if self.gains[i].0 > 0.0 || self.gains[i].1 > 0.0 {
+            if self.gains[i].0 > 1e-6
+                || self.gains[i].1 > 1e-6
+                || self.target_gains[i].0 > 0.0
+                || self.target_gains[i].1 > 0.0
+            {
                 let s = self.oscs[i].next();
                 let m = if i == 0 { rm_gain } else { 1.0 };
                 l += s * self.gains[i].0 * m;
@@ -704,6 +732,10 @@ pub struct EmbeddedEngine {
     num_active_slots: usize,
     cc_mapping: CCMapping,
     master_volume: f32,
+    /// Post-FX master gain after audio-taper + one-pole per-sample smoothing
+    /// (maps master_volume 0..1 -> 0..1.5 so the top of the throw gives up to
+    /// +3.5 dB of clean digital makeup gain before the DAC).
+    smooth_master_gain: f32,
     mod_wheel: f32,       // 0..1 from CC1
     aftertouch: f32,      // 0..1
     pitch_bend: f32,      // -1..1
@@ -742,6 +774,7 @@ impl EmbeddedEngine {
             num_active_slots: 0,
             cc_mapping: CCMapping::default_mappings(),
             master_volume: 0.7,
+            smooth_master_gain: 0.7 * (0.75 + 0.75 * 0.7),
             mod_wheel: 0.0,
             aftertouch: 0.0,
             pitch_bend: 0.0,
@@ -1163,8 +1196,17 @@ impl EmbeddedEngine {
         }
     }
 
+    #[inline]
+    fn master_taper(v: f32) -> f32 {
+        let v = v.clamp(0.0, 1.0);
+        v * (0.75 + 0.75 * v)
+    }
+
     pub fn set_master_volume(&mut self, v: Amplitude) {
         self.master_volume = v.clamp(0.0, 1.0);
+        if self.active_voice_count() == 0 {
+            self.smooth_master_gain = Self::master_taper(self.master_volume);
+        }
     }
 
     pub fn set_filter_mode(&mut self, mode: FilterMode) {
@@ -1189,7 +1231,7 @@ impl EmbeddedEngine {
         self.set_unison_spread(preset.unison_spread);
         self.bend_range = preset.pitch_bend_range as f32;
         self.stereo_width = preset.stereo_width;
-        self.master_volume = preset.master_volume.clamp(0.0, 1.0);
+        self.set_master_volume(preset.master_volume);
         self.mod_matrix = preset.mod_matrix;
         let reso = preset.filter_resonance.clamp(0.0, 1.0);
 
@@ -1264,6 +1306,9 @@ impl EmbeddedEngine {
             v.env3.set_release(preset.env3_release);
             v.fenv_amount = preset.filter_env_amount;
             v.base_cutoff = preset.filter_cutoff;
+            if !v.active {
+                v.smooth_cutoff = preset.filter_cutoff;
+            }
             v.resonance = reso;
             v.lfo_rate = eff_lfo1_rate;
             v.lfo.set_rate(eff_lfo1_rate);
@@ -1546,7 +1591,7 @@ impl EmbeddedEngine {
                 self.stereo_width = plain.clamp(0.0, 2.0);
             }
             SynthParam::MasterVolume => {
-                self.master_volume = plain.clamp(0.0, 1.0);
+                self.set_master_volume(plain);
             }
             SynthParam::DistortionType => {
                 self.effects
@@ -1585,7 +1630,7 @@ impl EmbeddedEngine {
                 let norm = value as f32 / 127.0;
                 match cc {
                     1 => self.mod_wheel = norm,
-                    7 => self.master_volume = norm,
+                    7 => self.set_master_volume(norm),
                     91 => {
                         self.effects.set_reverb_enabled(value > 0);
                         self.effects.set_reverb_mix(norm * 0.6);
@@ -1692,13 +1737,19 @@ impl EmbeddedEngine {
         if self.stereo_width != 1.0 {
             out = out.with_width(self.stereo_width);
         }
+        // Per-sample one-pole de-zipper on Master Volume (~15 ms time constant)
+        // with an audio-taper makeup curve: 0.0 -> 0.0, 0.5 -> 0.56, 0.7 -> 0.89,
+        // 1.0 -> 1.50 (+3.5 dB post-FX digital makeup gain before the DAC).
+        let target_vol = Self::master_taper(self.master_volume);
+        self.smooth_master_gain += 0.0015 * (target_vol - self.smooth_master_gain);
+
         if profile::enabled() {
             profile::add(profile::SAMPLES, 1);
             let _ft = profile::now();
-            out = self.effects.process_stereo(out) * self.master_volume;
+            out = self.effects.process_stereo(out) * self.smooth_master_gain;
             profile::add(profile::FX, profile::now() - _ft);
         } else {
-            out = self.effects.process_stereo(out) * self.master_volume;
+            out = self.effects.process_stereo(out) * self.smooth_master_gain;
         }
 
         StereoSample::new(soft_clip(out.left), soft_clip(out.right))
@@ -1803,7 +1854,7 @@ mod tests {
             );
             peak = peak.max(s.left.abs()).max(s.right.abs());
         }
-        assert!(peak > 0.04 && peak <= 1.0, "unexpected peak={peak}");
+        assert!(peak > 0.03 && peak <= 1.0, "unexpected peak={peak}");
     }
 
     #[test]
@@ -2020,5 +2071,47 @@ mod tests {
         assert!(p2 > p1 * 1.5, "2 notes ({p2}) should be clearly louder than 1 note ({p1})");
         assert!(p4 > p2 * 1.4, "4 notes ({p4}) should be clearly louder than 2 notes ({p2})");
         assert!(p4 <= 0.90, "4-note organ chord ({p4}) should stay in the linear region <= 0.90");
+    }
+
+    #[test]
+    fn low_freq_high_resonance_stays_controlled_and_volume_dezippers() {
+        let mut e = engine();
+        // Low bass notes (C1=24, G1=31, C2=36) with cutoff tuned near the
+        // fundamental (110 Hz), maximum resonance (1.0), and full volume (1.0).
+        e.set_param(SynthParam::MasterVolume, 1.0);
+        e.set_param(SynthParam::Osc1Level, 1.0);
+        e.set_param(SynthParam::Osc2Level, 0.8);
+        e.set_param(SynthParam::FilterCutoff, 110.0);
+        e.set_param(SynthParam::FilterResonance, 1.0);
+        for &n in &[24u8, 31, 36] {
+            e.receive_event(NoteEvent::note_on_midi(n, 127));
+        }
+        let mut peak = 0.0f32;
+        for _ in 0..8820 {
+            let s = e.next_sample_stereo();
+            peak = peak.max(s.left.abs()).max(s.right.abs());
+        }
+        assert!(
+            peak > 0.10 && peak <= 0.95,
+            "resonant low-freq bass peak ({peak}) out of controlled range"
+        );
+
+        // Now test volume de-zippering on a sustained sine: jumping
+        // MasterVolume from 0.1 to 1.0 mid-note must not cause a step jump.
+        let mut e2 = engine();
+        e2.set_param(SynthParam::Osc1Waveform, 0.0); // Sine
+        e2.set_param(SynthParam::MasterVolume, 0.1);
+        e2.receive_event(NoteEvent::note_on_midi(60, 127));
+        for _ in 0..2000 {
+            e2.next_sample_stereo();
+        }
+        let prev = e2.next_sample_stereo().left;
+        // Abrupt MIDI/Web volume jump while voice is active
+        e2.set_param(SynthParam::MasterVolume, 1.0);
+        let next = e2.next_sample_stereo().left;
+        assert!(
+            (next - prev).abs() < 0.02,
+            "volume change caused sample discontinuity: prev={prev}, next={next}"
+        );
     }
 }
