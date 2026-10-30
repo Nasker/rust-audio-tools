@@ -42,6 +42,7 @@ use std::f32::consts::PI;
 
 /// Samples between control-rate updates (LFO tick, mod matrix, filter coeffs).
 const CONTROL_DIV: u32 = 64;
+const INV_CONTROL_DIV: f32 = 1.0 / (CONTROL_DIV as f32);
 const MAX_OSCS: usize = 4;
 /// Per-oscillator static gain staging (~-9.3 dB below the old 0.25 single-voice
 /// scale). Leaves generous internal headroom for resonant low-frequency filters
@@ -258,6 +259,8 @@ pub struct LeanVoice {
     oscs: [LeanOsc; MAX_OSCS],
     /// Smoothed (level × OSC_GAIN × panL, level × OSC_GAIN × panR) per osc
     gains: [(f32, f32); MAX_OSCS],
+    /// Per-sample linear ramp increments across the 64-sample control tick
+    gain_steps: [(f32, f32); MAX_OSCS],
     /// Target per-oscillator stereo gains (smoothed toward in `control_tick`)
     target_gains: [(f32, f32); MAX_OSCS],
     osc_level: [f32; MAX_OSCS],
@@ -296,6 +299,7 @@ pub struct LeanVoice {
     age: u64,
     control_phase: u32,
     amp_lfo: f32,
+    amp_lfo_step: f32,
     last_amp: f32,
     fenv_amp: f32,
     env3_amp: f32,
@@ -324,6 +328,7 @@ impl LeanVoice {
                 LeanOsc::new(WaveformType::Sine),
             ],
             gains: [(0.0, 0.0); MAX_OSCS],
+            gain_steps: [(0.0, 0.0); MAX_OSCS],
             target_gains: [(0.0, 0.0); MAX_OSCS],
             osc_level: [0.0; MAX_OSCS],
             osc_pan: [0.0; MAX_OSCS],
@@ -357,6 +362,7 @@ impl LeanVoice {
             age: u64::MAX,
             control_phase: 0,
             amp_lfo: 1.0,
+            amp_lfo_step: 0.0,
             last_amp: 0.0,
             fenv_amp: 0.0,
             env3_amp: 0.0,
@@ -400,6 +406,9 @@ impl LeanVoice {
         }
         if !was_active {
             self.gains = self.target_gains;
+            self.gain_steps = [(0.0, 0.0); MAX_OSCS];
+            self.amp_lfo = 1.0;
+            self.amp_lfo_step = 0.0;
             self.smooth_cutoff = self.base_cutoff;
             self.amp_env.reset();
             self.fenv.reset();
@@ -570,10 +579,14 @@ impl LeanVoice {
                 self.target_gains[i] = (lvl * pl, lvl * pr);
             }
         }
-        // De-zipper oscillator gains across control ticks (~8 ms glide).
+        // Compute per-sample linear ramp increments across the next 64 samples
+        // (with a 0.45 one-pole slew filter so even Square/Saw LFO edges glide
+        // over ~3 ms instead of snapping, and Sine/Tri LFOs on Pan/Level never
+        // produce 689 Hz control-rate staircase "shizzle").
         for i in 0..MAX_OSCS {
-            self.gains[i].0 += 0.18 * (self.target_gains[i].0 - self.gains[i].0);
-            self.gains[i].1 += 0.18 * (self.target_gains[i].1 - self.gains[i].1);
+            let dl = 0.45 * (self.target_gains[i].0 - self.gains[i].0);
+            let dr = 0.45 * (self.target_gains[i].1 - self.gains[i].1);
+            self.gain_steps[i] = (dl * INV_CONTROL_DIV, dr * INV_CONTROL_DIV);
         }
         if pw_dirty {
             for i in 0..MAX_OSCS {
@@ -618,7 +631,8 @@ impl LeanVoice {
         }
         self.filter_bypass = bypass;
 
-        self.amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
+        let target_amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
+        self.amp_lfo_step = 0.45 * (target_amp_lfo - self.amp_lfo) * INV_CONTROL_DIV;
     }
 
     #[link_section = ".iram1.text"]
@@ -673,6 +687,8 @@ impl LeanVoice {
             || self.osc4_fm != 0.0
             || self.osc4_rm != 0.0
         {
+            self.gains[3].0 += self.gain_steps[3].0;
+            self.gains[3].1 += self.gain_steps[3].1;
             let v = self.oscs[3].next();
             l += v * self.gains[3].0;
             r += v * self.gains[3].1;
@@ -700,6 +716,8 @@ impl LeanVoice {
                 || self.target_gains[i].0 > 0.0
                 || self.target_gains[i].1 > 0.0
             {
+                self.gains[i].0 += self.gain_steps[i].0;
+                self.gains[i].1 += self.gain_steps[i].1;
                 let s = self.oscs[i].next();
                 let m = if i == 0 { rm_gain } else { 1.0 };
                 l += s * self.gains[i].0 * m;
@@ -719,6 +737,7 @@ impl LeanVoice {
         if profile::enabled() {
             profile::add(profile::FILTER, profile::now() - _ft);
         }
+        self.amp_lfo += self.amp_lfo_step;
         let g = amp * self.velocity * self.amp_lfo;
         StereoSample::new(fl * g * self.uni_gain.0, fr * g * self.uni_gain.1)
     }
@@ -2113,5 +2132,51 @@ mod tests {
             (next - prev).abs() < 0.02,
             "volume change caused sample discontinuity: prev={prev}, next={next}"
         );
+    }
+
+    #[test]
+    fn lfo_pan_and_amp_modulation_ramps_per_sample_without_staircase_jumps() {
+        let mut e = engine();
+        // Route a fast Square LFO2 to both Osc1Pan and Amplitude so every LFO
+        // flip would be a worst-case step jump if not interpolated per sample.
+        e.set_lfo2_rate(12.0);
+        e.set_lfo2_depth(1.0);
+        e.set_lfo2_waveform(LfoWaveform::Square);
+        e.set_mod_slot(
+            0,
+            ModSlot {
+                enabled: true,
+                source: ModSource::Lfo2,
+                dest: ModDest::Osc1Pan,
+                amount: 1.0,
+            },
+        );
+        e.set_mod_slot(
+            1,
+            ModSlot {
+                enabled: true,
+                source: ModSource::Lfo2,
+                dest: ModDest::Amplitude,
+                amount: 0.8,
+            },
+        );
+        e.receive_event(NoteEvent::note_on_midi(60, 127));
+        let mut prev_g = e.voices[0].gains[0].0;
+        let mut prev_amp = e.voices[0].amp_lfo;
+        let mut max_dg = 0.0f32;
+        let mut max_damp = 0.0f32;
+        for _ in 0..8820 {
+            e.next_sample_stereo();
+            let g = e.voices[0].gains[0].0;
+            let a = e.voices[0].amp_lfo;
+            max_dg = max_dg.max((g - prev_g).abs());
+            max_damp = max_damp.max((a - prev_amp).abs());
+            prev_g = g;
+            prev_amp = a;
+        }
+        // Per-sample step must be tiny (~1/64 of the control-tick slew), never
+        // a 64-sample staircase jump.
+        assert!(max_dg < 0.002, "pan gain stepped too abruptly: max_dg={max_dg}");
+        assert!(max_damp < 0.015, "amp_lfo stepped too abruptly: max_damp={max_damp}");
     }
 }
