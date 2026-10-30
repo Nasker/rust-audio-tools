@@ -43,32 +43,12 @@ use std::f32::consts::PI;
 /// Samples between control-rate updates (LFO tick, mod matrix, filter coeffs).
 const CONTROL_DIV: u32 = 64;
 const MAX_OSCS: usize = 4;
+/// Per-oscillator static gain staging (~-7 dB below the old 0.25 single-voice
+/// scale). Budgets clean linear headroom for 4–5 polyphonic voices with
+/// multiple active oscillators at MasterVolume = 1.0 without dynamic ducking.
+const OSC_GAIN: f32 = 0.11;
 /// Mono-mode key stack capacity (last-note priority, newest on top).
 const KEY_STACK_CAP: usize = 16;
-/// Clip-guard look-ahead: 128 internal frames (~2.9 ms @ 44.1 kHz,
-/// ~5.8 ms @ 22.05 kHz). Power of two — index by mask.
-const LOOKAHEAD: usize = 128;
-/// Output ceiling the look-ahead gain enforces. Below the `soft_clip`
-/// knee (0.75)? No — intentionally above: the guard is the brick wall,
-/// the final `soft_clip` only rounds the residual shoulder.
-const CLIP_GUARD: f32 = 0.90;
-/// Per-sample approach rates for the guard gain. Attack converges in
-/// ~50 samples — inside the 128-sample look-ahead so the gain is fully
-/// down before the peak exits the window. Scaled by `comp_rate_scale`
-/// at half rate (the window is twice as long then, so it still fits).
-const LA_ATTACK: f32 = 0.12;
-const LA_RELEASE: f32 = 0.0004;
-/// Feedforward gain staging on the raw voice mix: the per-voice peak bound
-/// (velocity × Σosc_level × 0.25 × unison) is known at note-on, before the
-/// envelope rises — so the mix is scaled to keep the *predicted* sum under
-/// STAGE_TARGET before a single hot sample reaches the FX/limiter chain.
-/// Quiet material gets up to STAGE_MAX_BOOST of makeup; the smoothing is
-/// asymmetric (fast tuck ~1 ms, slow boost ~200 ms) so note-on staging is
-/// instant while recovery never zippers.
-const STAGE_TARGET: f32 = 0.55;
-const STAGE_MAX_BOOST: f32 = 1.6;
-const STAGE_DOWN: f32 = 0.02;
-const STAGE_UP: f32 = 0.0008;
 
 /// Cycle-count a pipeline stage when a profiler hook is installed; a single
 /// predictable branch per call otherwise.
@@ -272,7 +252,7 @@ fn pan_gains(pan: f32) -> (f32, f32) {
 
 pub struct LeanVoice {
     oscs: [LeanOsc; MAX_OSCS],
-    /// (level × 0.25 × panL, level × 0.25 × panR) per osc
+    /// (level × OSC_GAIN × panL, level × OSC_GAIN × panR) per osc
     gains: [(f32, f32); MAX_OSCS],
     osc_level: [f32; MAX_OSCS],
     osc_pan: [f32; MAX_OSCS],
@@ -304,10 +284,6 @@ pub struct LeanVoice {
     glide_target: Frequency,
     gliding: bool,
     velocity: Amplitude,
-    /// Worst-case per-channel contribution: velocity × Σosc_level × 0.25 ×
-    /// uni_gain — refreshed at note-on and every control tick so the engine
-    /// can reserve headroom before envelopes rise.
-    peak_bound: f32,
     note: MidiNote,
     active: bool,
     age: u64,
@@ -367,7 +343,6 @@ impl LeanVoice {
             glide_target: 440.0,
             gliding: false,
             velocity: 0.0,
-            peak_bound: 0.0,
             note: 0,
             active: false,
             age: u64::MAX,
@@ -387,7 +362,7 @@ impl LeanVoice {
     fn update_gains(&mut self) {
         for i in 0..MAX_OSCS {
             let (pl, pr) = pan_gains(self.osc_pan[i]);
-            let lvl = self.osc_level[i] * 0.25;
+            let lvl = self.osc_level[i] * OSC_GAIN;
             self.gains[i] = (lvl * pl, lvl * pr);
         }
     }
@@ -396,13 +371,7 @@ impl LeanVoice {
         let was_active = self.active && self.amp_env.state() != EnvelopeState::Idle;
         let freq = midi_to_frequency(note);
         self.note = note;
-        // Gentle velocity curve (concave power) so max-velocity hits stay
-        // punchy without jumping disproportionately in peak level.
-        self.velocity = velocity.clamp(0.0, 1.0).sqrt();
-        self.peak_bound = self.velocity
-            * self.osc_level.iter().sum::<f32>()
-            * 0.25
-            * self.uni_gain.0.max(self.uni_gain.1);
+        self.velocity = velocity.clamp(0.0, 1.0);
         self.active = true;
         self.age = age;
         if portamento > 0.005 && was_active {
@@ -583,7 +552,7 @@ impl LeanVoice {
         if gains_dirty {
             for i in 0..MAX_OSCS {
                 let (pl, pr) = pan_gains(self.osc_pan[i] + pan_off[i]);
-                let lvl = (self.osc_level[i] + lvl_off[i]).clamp(0.0, 1.0) * 0.25;
+                let lvl = (self.osc_level[i] + lvl_off[i]).clamp(0.0, 1.0) * OSC_GAIN;
                 self.gains[i] = (lvl * pl, lvl * pr);
             }
         }
@@ -628,15 +597,6 @@ impl LeanVoice {
         self.filter_bypass = bypass;
 
         self.amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
-        // Refresh the headroom bound with live (mod-offset) levels — includes
-        // amp_lfo overshoot >1 so tremolo peaks are staged too.
-        self.peak_bound = self.velocity
-            * (0..MAX_OSCS)
-                .map(|i| (self.osc_level[i] + lvl_off[i]).clamp(0.0, 1.0))
-                .sum::<f32>()
-            * 0.25
-            * self.amp_lfo
-            * self.uni_gain.0.max(self.uni_gain.1);
     }
 
     #[link_section = ".iram1.text"]
@@ -762,23 +722,6 @@ pub struct EmbeddedEngine {
     unison_spread: f32,
     age_counter: u64,
     stereo_width: f32,
-    comp_env: f32,        // stereo bus compressor/limiter envelope follower
-    comp_rate_scale: f32, // scales comp_env coefficients when rate != 44100
-    // Look-ahead clip guard: ring of post-FX samples + a monotonic
-    // descending max-queue so the window peak is known LOOKAHEAD frames
-    // before it reaches the output. `la_gain` therefore ramps down in
-    // time to brick-wall every transient instead of clipping after it.
-    la_ring: [StereoSample; LOOKAHEAD],
-    la_pos: usize,
-    la_counter: u32,
-    la_q: [(u32, f32); LOOKAHEAD], // (sequence, |peak|) descending values
-    la_q_head: usize,
-    la_q_len: usize,
-    la_gain: f32,
-    // Feedforward gain staging on the raw voice mix — smoothed attenuation
-    // derived from the predicted sum of per-voice peak bounds, so hot
-    // patches are scaled BEFORE the FX/limiter chain ever sees them.
-    stage_gain: f32,
     voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
     bpm: f32,             // tempo in BPM (20..300) for synced LFOs and delay
     lfo1_rate: f32,       // unsynced LFO1 rate in Hz
@@ -812,16 +755,6 @@ impl EmbeddedEngine {
             unison_spread: 0.7,
             age_counter: 0,
             stereo_width: 1.0,
-            comp_env: 0.0,
-            comp_rate_scale: 1.0,
-            la_ring: [StereoSample::ZERO; LOOKAHEAD],
-            la_pos: 0,
-            la_counter: 0,
-            la_q: [(0, 0.0); LOOKAHEAD],
-            la_q_head: 0,
-            la_q_len: 0,
-            la_gain: 1.0,
-            stage_gain: 1.0,
             voice_cap: max_voices,
             bpm: 120.0,
             lfo1_rate: 4.0,
@@ -851,7 +784,6 @@ impl EmbeddedEngine {
             v.lfo2.set_sample_rate(ctrl_sr);
         }
         self.effects.set_sample_rate(sample_rate);
-        self.comp_rate_scale = sample_rate as f32 / 44_100.0;
     }
 
     /// Effective polyphony limit — `pick_voice` only allocates from the
@@ -1749,27 +1681,14 @@ impl EmbeddedEngine {
         let active_slots = &self.active_slots[..self.num_active_slots];
         let mut l = 0.0f32;
         let mut r = 0.0f32;
-        let mut bound = 0.0f32;
         for v in &mut self.voices {
             if v.active {
                 let s = v.next_stereo(bend_norm, bend_semi, mod_wheel, aftertouch, active_slots);
                 l += s.left;
                 r += s.right;
-                bound += v.peak_bound;
             }
         }
-        // Feedforward gain staging BEFORE the mix reaches the FX/limiter
-        // chain: `bound` is the predicted worst-case peak (velocity × osc
-        // levels × unison, refreshed per control tick), so the attenuation
-        // is already in place when a hot note's envelope starts rising —
-        // the comp/guard below then only deal with residue, not the bulk.
-        // Quiet material is lifted up to STAGE_MAX_BOOST; the tuck is fast
-        // (~1 ms, in place before the attack lands) and the boost is slow
-        // (~30 ms) so it breathes rather than zippers.
-        let target = (STAGE_TARGET / bound.max(0.05)).min(STAGE_MAX_BOOST);
-        let c = if target < self.stage_gain { STAGE_DOWN } else { STAGE_UP } * self.comp_rate_scale;
-        self.stage_gain += c * (target - self.stage_gain);
-        let mut out = StereoSample::new(l * self.stage_gain, r * self.stage_gain);
+        let mut out = StereoSample::new(l, r);
         if self.stereo_width != 1.0 {
             out = out.with_width(self.stereo_width);
         }
@@ -1782,68 +1701,19 @@ impl EmbeddedEngine {
             out = self.effects.process_stereo(out) * self.master_volume;
         }
 
-        // Stereo bus peak compressor/limiter: fast (~1.5 ms) attack, smooth
-        // (~120 ms) release above 0.60 threshold so resonant or multi-voice
-        // peaks are leveled cleanly without waveshaper buzz.
-        let peak = out.left.abs().max(out.right.abs());
-        let coeff = if peak > self.comp_env { 0.015 } else { 0.0002 } * self.comp_rate_scale;
-        self.comp_env += coeff * (peak - self.comp_env);
-        if self.comp_env < 1e-18 {
-            self.comp_env = 0.0;
-        }
-        if self.comp_env > 0.60 {
-            let excess = self.comp_env - 0.60;
-            let target = 0.60 + 0.32 * (excess / (0.32 + excess));
-            let gain = target / self.comp_env;
-            out.left *= gain;
-            out.right *= gain;
-        }
-
-        // Look-ahead clip guard. The leveled signal enters a LOOKAHEAD-frame
-        // delay line; a descending max-queue tracks the window peak, so the
-        // needed gain is known before the peak reaches the output and
-        // `la_gain` converges while the transient is still in flight. Every
-        // peak therefore exits attenuated — the reactive compressor above
-        // can't overshoot into the clipper anymore.
-        let p = out.left.abs().max(out.right.abs());
-        while self.la_q_len > 0
-            && self.la_q[(self.la_q_head + self.la_q_len - 1) & (LOOKAHEAD - 1)].1 <= p
-        {
-            self.la_q_len -= 1;
-        }
-        self.la_q[(self.la_q_head + self.la_q_len) & (LOOKAHEAD - 1)] = (self.la_counter, p);
-        self.la_q_len += 1;
-        self.la_counter += 1;
-        if self.la_q_len > 0 && self.la_counter - self.la_q[self.la_q_head].0 > LOOKAHEAD as u32 {
-            self.la_q_head = (self.la_q_head + 1) & (LOOKAHEAD - 1);
-            self.la_q_len -= 1;
-        }
-        let delayed = self.la_ring[self.la_pos];
-        self.la_ring[self.la_pos] = out;
-        self.la_pos = (self.la_pos + 1) & (LOOKAHEAD - 1);
-        let win_peak = self.la_q[self.la_q_head].1;
-        let need = if win_peak > CLIP_GUARD { CLIP_GUARD / win_peak } else { 1.0 };
-        let rs = self.comp_rate_scale;
-        if need < self.la_gain {
-            self.la_gain += (need - self.la_gain) * LA_ATTACK * rs;
-        } else {
-            self.la_gain += (1.0 - self.la_gain) * LA_RELEASE * rs;
-        }
-        out.left = delayed.left * self.la_gain;
-        out.right = delayed.right * self.la_gain;
-
         StereoSample::new(soft_clip(out.left), soft_clip(out.right))
     }
 }
 
 #[inline]
 pub fn soft_clip(x: f32) -> f32 {
-    if x.abs() <= 0.75 {
+    if x.abs() <= 0.90 {
         x
     } else {
-        // Smoothly compress above 0.75 into [-1.0, 1.0] (never exceeds ±1).
-        let excess = x.abs() - 0.75;
-        x.signum() * (0.75 + 0.25 * (excess / (0.25 + excess)))
+        // C1-smooth safety shoulder above 0.90 into [-1.0, 1.0]: completely
+        // linear up to 0.90 so normal polyphonic playing is untouched.
+        let excess = x.abs() - 0.90;
+        x.signum() * (0.90 + 0.10 * (excess / (0.10 + excess)))
     }
 }
 
@@ -1868,7 +1738,7 @@ mod tests {
             let s = e.next_sample_stereo();
             peak = peak.max(s.left.abs()).max(s.right.abs());
         }
-        assert!(peak > 0.05, "expected audible output, peak={peak}");
+        assert!(peak > 0.02, "expected audible output, peak={peak}");
     }
 
     #[test]
@@ -1933,7 +1803,7 @@ mod tests {
             );
             peak = peak.max(s.left.abs()).max(s.right.abs());
         }
-        assert!(peak > 0.1 && peak <= 1.0, "unexpected peak={peak}");
+        assert!(peak > 0.04 && peak <= 1.0, "unexpected peak={peak}");
     }
 
     #[test]
@@ -2105,42 +1975,50 @@ mod tests {
     }
 
     #[test]
-    fn lookahead_guard_brickwalls_hot_transients() {
-        let mut e = engine();
-        // Hot patch: master at 1.0, all four oscs at full level, five
-        // max-velocity notes — raw mix peaks well above unity.
-        e.set_param(SynthParam::MasterVolume, 1.0);
-        for p in [
-            SynthParam::Osc1Level,
-            SynthParam::Osc2Level,
-            SynthParam::Osc3Level,
-            SynthParam::Osc4Level,
-        ] {
-            e.set_param(p, 1.0);
-        }
-        for n in [36u8, 48, 60, 64, 67] {
-            e.receive_event(NoteEvent::note_on_midi(n, 127));
-        }
-        let mut worst = 0.0f32;
-        let mut min_gain = 1.0f32;
-        let mut min_stage = 1.0f32;
-        for _ in 0..44100 {
-            let s = e.next_sample_stereo();
-            worst = worst.max(s.left.abs()).max(s.right.abs());
-            min_gain = min_gain.min(e.la_gain);
-            min_stage = min_stage.min(e.stage_gain);
-            assert!(
-                s.left.is_finite() && s.right.is_finite()
-                    && s.left.abs() <= 1.0 && s.right.abs() <= 1.0,
-                "output escaped the clip guard: {s:?}"
-            );
-        }
-        // Hot material must be tamed by SOME stage — feedforward staging
-        // tucks the predicted sum, the guard catches whatever spikes past.
-        assert!(
-            min_stage < 0.95 || min_gain < 0.95,
-            "no gain stage engaged (stage={min_stage} guard={min_gain})"
-        );
-        assert!(worst <= 0.95, "peak {worst} overshot the clip guard");
+    fn static_gain_staging_preserves_chord_dynamics_without_clipping() {
+        // Drawbar-style Organ patch (3 sine oscs at 0.9 / 0.7 / 0.5) at full
+        // MasterVolume = 1.0 and max velocity 127.
+        let measure_chord_peak = |notes: &[u8]| -> f32 {
+            let mut e = engine();
+            e.set_param(SynthParam::MasterVolume, 1.0);
+            for p in [
+                SynthParam::Osc1Waveform,
+                SynthParam::Osc2Waveform,
+                SynthParam::Osc3Waveform,
+            ] {
+                e.set_param(p, 0.0); // Sine
+            }
+            e.set_param(SynthParam::Osc1Level, 0.9);
+            e.set_param(SynthParam::Osc2Level, 0.7);
+            e.set_param(SynthParam::Osc2Semitones, 12.0);
+            e.set_param(SynthParam::Osc3Level, 0.5);
+            e.set_param(SynthParam::Osc3Semitones, 19.0);
+            for &n in notes {
+                e.receive_event(NoteEvent::note_on_midi(n, 127));
+            }
+            let mut peak = 0.0f32;
+            for _ in 0..8820 {
+                let s = e.next_sample_stereo();
+                assert!(
+                    s.left.is_finite()
+                        && s.right.is_finite()
+                        && s.left.abs() <= 1.0
+                        && s.right.abs() <= 1.0,
+                    "output out of bounds: {s:?}"
+                );
+                peak = peak.max(s.left.abs()).max(s.right.abs());
+            }
+            peak
+        };
+
+        let p1 = measure_chord_peak(&[60]);
+        let p2 = measure_chord_peak(&[60, 64]);
+        let p4 = measure_chord_peak(&[60, 64, 67, 72]);
+
+        // Chords must scale up naturally (no auto-dimming) while keeping
+        // 4-note full-velocity chords inside the linear range (<= 0.90).
+        assert!(p2 > p1 * 1.5, "2 notes ({p2}) should be clearly louder than 1 note ({p1})");
+        assert!(p4 > p2 * 1.4, "4 notes ({p4}) should be clearly louder than 2 notes ({p2})");
+        assert!(p4 <= 0.90, "4-note organ chord ({p4}) should stay in the linear region <= 0.90");
     }
 }
