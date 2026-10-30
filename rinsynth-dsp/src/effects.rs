@@ -31,16 +31,6 @@ pub trait StereoEffect: Send {
     fn reset(&mut self);
 }
 
-/// One-pole parameter smoother that snaps to the target once close — lets
-/// callers skip the update entirely once `cur == target` (exact fixed point).
-#[inline(always)]
-fn slew(cur: &mut f32, target: f32, coeff: f32) {
-    *cur += coeff * (target - *cur);
-    if (target - *cur).abs() < 1e-5 {
-        *cur = target;
-    }
-}
-
 // ============================================================================
 // DELAY
 // ============================================================================
@@ -70,6 +60,11 @@ impl DelayLine {
     }
 
     #[inline(always)]
+    fn read(&self, delay_samples: usize) -> Sample {
+        self.buffer[self.write_pos.wrapping_sub(delay_samples) & self.mask]
+    }
+
+    #[inline(always)]
     fn read_interpolated(&self, delay_samples: f32) -> Sample {
         let delay_int = delay_samples as usize;
         let frac = delay_samples - delay_int as f32;
@@ -93,9 +88,6 @@ pub struct Delay {
     delay_time: f32, // Delay time in seconds (0.0 - 2.0)
     feedback: f32,   // Feedback amount (0.0 - 0.95)
     mix: f32,        // Dry/wet mix (0.0 = dry, 1.0 = wet)
-    smooth_time: f32,
-    smooth_feedback: f32,
-    smooth_mix: f32,
     ping_pong: bool, // Enable ping-pong mode
     // Tempo sync: when on, delay_time = beats * 60/bpm
     tempo_sync: bool,
@@ -117,9 +109,6 @@ impl Delay {
             delay_time: 0.3,
             feedback: 0.4,
             mix: 0.3,
-            smooth_time: 0.3,
-            smooth_feedback: 0.4,
-            smooth_mix: 0.3,
             ping_pong: true, // Ping-pong on by default for stereo goodness
             tempo_sync: false,
             sync_beats: 1.0,
@@ -201,41 +190,29 @@ impl Delay {
         let eff_feedback = (self.feedback + self.feedback_mod).clamp(0.0, 0.95);
         let eff_mix = (self.mix + self.mix_mod).clamp(0.0, 1.0);
 
-        // Per-sample one-pole smoothing + fractional delay interpolation so
-        // dragging Delay Time / Feedback / Mix never scratches or clicks.
-        // `slew` snaps on converge so the compare-guard skips the updates
-        // entirely in steady state.
-        if self.smooth_time != eff_time
-            || self.smooth_feedback != eff_feedback
-            || self.smooth_mix != eff_mix
-        {
-            slew(&mut self.smooth_time, eff_time, 0.0005);
-            slew(&mut self.smooth_feedback, eff_feedback, 0.0015);
-            slew(&mut self.smooth_mix, eff_mix, 0.0015);
-        }
+        let delay_samples = (eff_time * self.sample_rate as f32) as usize;
+        let delay_samples = delay_samples.max(1);
 
-        let delay_samples = (self.smooth_time * self.sample_rate as f32).max(1.0);
-
-        let delayed_l = self.delay_line_l.read_interpolated(delay_samples);
-        let delayed_r = self.delay_line_r.read_interpolated(delay_samples);
+        let delayed_l = self.delay_line_l.read(delay_samples);
+        let delayed_r = self.delay_line_r.read(delay_samples);
 
         if self.ping_pong {
             // Ping-pong: L feeds into R, R feeds into L
             self.delay_line_l
-                .write(input.left + delayed_r * self.smooth_feedback);
+                .write(input.left + delayed_r * eff_feedback);
             self.delay_line_r
-                .write(input.right + delayed_l * self.smooth_feedback);
+                .write(input.right + delayed_l * eff_feedback);
         } else {
             // Standard stereo delay
             self.delay_line_l
-                .write(input.left + delayed_l * self.smooth_feedback);
+                .write(input.left + delayed_l * eff_feedback);
             self.delay_line_r
-                .write(input.right + delayed_r * self.smooth_feedback);
+                .write(input.right + delayed_r * eff_feedback);
         }
 
         StereoSample::new(
-            input.left * (1.0 - self.smooth_mix) + delayed_l * self.smooth_mix,
-            input.right * (1.0 - self.smooth_mix) + delayed_r * self.smooth_mix,
+            input.left * (1.0 - eff_mix) + delayed_l * eff_mix,
+            input.right * (1.0 - eff_mix) + delayed_r * eff_mix,
         )
     }
 }
@@ -348,11 +325,6 @@ pub struct Reverb {
     room_size: f32, // 0.0 - 1.0
     damping: f32,   // 0.0 - 1.0
     mix: f32,       // Dry/wet mix
-    smooth_mix: f32,
-    /// Room-size and damping feed comb feedback/damping coefficients inside
-    /// the FDN; converge toward the targets so mid-tail drags don't thump.
-    smooth_room: f32,
-    smooth_damp: f32,
     sample_rate: SampleRate,
     mix_mod: f32, // Matrix modulation offset on mix
     half_step: bool,
@@ -370,9 +342,6 @@ impl Reverb {
             room_size: 0.5,
             damping: 0.5,
             mix: 0.3,
-            smooth_mix: 0.3,
-            smooth_room: 0.5,
-            smooth_damp: 0.5,
             sample_rate,
             mix_mod: 0.0,
             half_step: false,
@@ -414,15 +383,26 @@ impl Reverb {
             .collect();
     }
 
-    /// Targets only — `process_stereo` converges `smooth_room`/`smooth_damp`
-    /// and pushes the derived comb coefficients, so mid-tail drags glide
-    /// instead of jumping the feedback coefficients in one step.
     pub fn set_room_size(&mut self, size: f32) {
         self.room_size = size.clamp(0.0, 1.0);
+        // Update comb filter feedback
+        let feedback = 0.84 + self.room_size * 0.12;
+        for comb in &mut self.combs_l {
+            comb.feedback = feedback;
+        }
+        for comb in &mut self.combs_r {
+            comb.feedback = feedback;
+        }
     }
 
     pub fn set_damping(&mut self, damping: f32) {
         self.damping = damping.clamp(0.0, 1.0);
+        for comb in &mut self.combs_l {
+            comb.damp = self.damping;
+        }
+        for comb in &mut self.combs_r {
+            comb.damp = self.damping;
+        }
     }
 
     pub fn set_mix(&mut self, mix: f32) {
@@ -449,21 +429,6 @@ impl Reverb {
     pub fn process_stereo(&mut self, input: StereoSample) -> StereoSample {
         self.half_step = !self.half_step;
         if self.half_step {
-            // Converge room/damping toward targets (~90 ms constant at the
-            // half-rate tick) and push comb coefficients only when they move.
-            if self.smooth_room != self.room_size || self.smooth_damp != self.damping {
-                slew(&mut self.smooth_room, self.room_size, 0.005);
-                slew(&mut self.smooth_damp, self.damping, 0.005);
-                let feedback = 0.84 + self.smooth_room * 0.12;
-                for comb in &mut self.combs_l {
-                    comb.feedback = feedback;
-                    comb.damp = self.smooth_damp;
-                }
-                for comb in &mut self.combs_r {
-                    comb.feedback = feedback;
-                    comb.damp = self.smooth_damp;
-                }
-            }
             // Sum of parallel comb filters (separate L/R)
             let mut comb_sum_l: Sample = 0.0;
             let mut comb_sum_r: Sample = 0.0;
@@ -489,14 +454,11 @@ impl Reverb {
             self.wet_r = output_r;
         }
 
-        // Mix dry and wet (one-pole smoothed to prevent zipper noise)
+        // Mix dry and wet
         let eff_mix = (self.mix + self.mix_mod).clamp(0.0, 1.0);
-        if self.smooth_mix != eff_mix {
-            slew(&mut self.smooth_mix, eff_mix, 0.0015);
-        }
         StereoSample::new(
-            input.left * (1.0 - self.smooth_mix) + self.wet_l * self.smooth_mix,
-            input.right * (1.0 - self.smooth_mix) + self.wet_r * self.smooth_mix,
+            input.left * (1.0 - eff_mix) + self.wet_l * eff_mix,
+            input.right * (1.0 - eff_mix) + self.wet_r * eff_mix,
         )
     }
 }
@@ -540,8 +502,6 @@ pub struct Chorus {
     rate: f32,          // LFO rate in Hz (0.1 - 5.0)
     depth: f32,         // Modulation depth in ms (0.0 - 10.0)
     mix: f32,           // Dry/wet mix
-    smooth_depth: f32,
-    smooth_mix: f32,
     stereo_spread: f32, // LFO phase offset for stereo (0.0 - 0.5)
     sample_rate: SampleRate,
     // Matrix modulation offsets: rate_mod is an octave exponent
@@ -560,8 +520,6 @@ impl Chorus {
             rate: 1.5,
             depth: 3.0,
             mix: 0.5,
-            smooth_depth: 3.0,
-            smooth_mix: 0.5,
             stereo_spread: 0.25, // 90 degrees phase offset
             sample_rate,
             rate_mod: 0.0,
@@ -626,16 +584,12 @@ impl Chorus {
             self.lfo_phase -= 1.0;
         }
 
-        // Modulated delay times (smoothed per sample so Depth/Mix drags never scratch)
+        // Modulated delay times
         let eff_depth = (self.depth + self.depth_mod * 5.0).clamp(0.0, 15.0);
         let eff_mix = (self.mix + self.mix_mod).clamp(0.0, 1.0);
-        if self.smooth_depth != eff_depth || self.smooth_mix != eff_mix {
-            slew(&mut self.smooth_depth, eff_depth, 0.0015);
-            slew(&mut self.smooth_mix, eff_mix, 0.0015);
-        }
         let center_delay_ms = 7.0;
-        let delay_ms_l = center_delay_ms + lfo_l * self.smooth_depth * 0.5;
-        let delay_ms_r = center_delay_ms + lfo_r * self.smooth_depth * 0.5;
+        let delay_ms_l = center_delay_ms + lfo_l * eff_depth * 0.5;
+        let delay_ms_r = center_delay_ms + lfo_r * eff_depth * 0.5;
         let delay_samples_l = delay_ms_l * 0.001 * self.sample_rate as f32;
         let delay_samples_r = delay_ms_r * 0.001 * self.sample_rate as f32;
 
@@ -649,8 +603,8 @@ impl Chorus {
 
         // Mix dry and wet
         StereoSample::new(
-            input.left * (1.0 - self.smooth_mix) + delayed_l * self.smooth_mix,
-            input.right * (1.0 - self.smooth_mix) + delayed_r * self.smooth_mix,
+            input.left * (1.0 - eff_mix) + delayed_l * eff_mix,
+            input.right * (1.0 - eff_mix) + delayed_r * eff_mix,
         )
     }
 }
@@ -684,18 +638,11 @@ impl Effect for Chorus {
 pub struct Distortion {
     drive: f32,
     mix: f32,
-    smooth_drive: f32,
-    smooth_mix: f32,
     dtype: DistortionType,
-    /// Previous topology during a type-switch crossfade (0 samples = done).
-    prev_type: DistortionType,
-    xfade: u8,
     // Precomputed level compensation (sqrt denominators are soft-float on
     // Xtensa — cache them in set_drive instead of computing per sample).
     tube_comp: f32,
     fuzz_comp: f32,
-    smooth_tube_comp: f32,
-    smooth_fuzz_comp: f32,
     // Bitcrush: samples held so far and held value, per channel [L, R].
     bc_count: [u32; 2],
     bc_held: [Sample; 2],
@@ -706,15 +653,9 @@ impl Distortion {
         Self {
             drive: 0.0,
             mix: 0.5,
-            smooth_drive: 0.0,
-            smooth_mix: 0.5,
             dtype: DistortionType::Tube,
-            prev_type: DistortionType::Tube,
-            xfade: 0,
             tube_comp: 1.0,
             fuzz_comp: 1.25,
-            smooth_tube_comp: 1.0,
-            smooth_fuzz_comp: 1.25,
             bc_count: [0; 2],
             bc_held: [0.0; 2],
         }
@@ -722,18 +663,12 @@ impl Distortion {
 
     #[inline]
     fn shape(&mut self, x: f32, ch: usize) -> f32 {
-        self.shape_as(self.dtype, x, ch)
-    }
-
-    #[inline]
-    fn shape_as(&mut self, dtype: DistortionType, x: f32, ch: usize) -> f32 {
-        let d = self.smooth_drive;
-        if d <= 1e-5 {
+        if self.drive <= 0.0 {
             return x;
         }
-        match dtype {
+        match self.dtype {
             DistortionType::Tube => {
-                let gain = 1.0 + 29.0 * d;
+                let gain = 1.0 + 29.0 * self.drive;
                 // tanh clip via Pade [3/3] (<=0.02 error for |x|<3; saturates
                 // past it) — libm tanh is soft-float and costly on Xtensa.
                 let y = x * gain;
@@ -743,18 +678,18 @@ impl Distortion {
                 } else {
                     y * (27.0 + y2) / (27.0 + 9.0 * y2)
                 };
-                t * self.smooth_tube_comp
+                t * self.tube_comp
             }
             DistortionType::Fuzz => {
-                let gain = 1.0 + 49.0 * d;
+                let gain = 1.0 + 49.0 * self.drive;
                 // Bias for asymmetry, then hard clip; keep level roughly even.
-                let y = x * gain + 0.3 * d;
-                y.clamp(-0.8, 0.8) * self.smooth_fuzz_comp
+                let y = x * gain + 0.3 * self.drive;
+                y.clamp(-0.8, 0.8) * self.fuzz_comp
             }
             DistortionType::Bitcrush => {
                 // Drive → hold length 1..48 samples and bit depth 12..3 bits.
-                let hold_len = 1 + (d * 47.0) as u32;
-                let bits = (12.0 - d * 9.0).clamp(3.0, 12.0);
+                let hold_len = 1 + (self.drive * 47.0) as u32;
+                let bits = (12.0 - self.drive * 9.0).clamp(3.0, 12.0);
                 if self.bc_count[ch] >= hold_len {
                     let levels = 2.0f32.powi(bits as i32);
                     self.bc_held[ch] = (x * levels).round() / levels;
@@ -764,7 +699,7 @@ impl Distortion {
                 self.bc_held[ch]
             }
             DistortionType::Fold => {
-                let gain = 1.0 + 29.0 * d;
+                let gain = 1.0 + 29.0 * self.drive;
                 // Sine fold: bounded, no DC offset, turns saws into clusters.
                 // sine_lut only wraps ±1 turn, so wrap the (large) argument
                 // first — avoids libm sinf range reduction on Xtensa.
@@ -778,29 +713,11 @@ impl Distortion {
     }
 
     pub fn process_stereo(&mut self, input: StereoSample) -> StereoSample {
-        if self.smooth_drive != self.drive
-            || self.smooth_mix != self.mix
-            || self.smooth_tube_comp != self.tube_comp
-            || self.smooth_fuzz_comp != self.fuzz_comp
-        {
-            slew(&mut self.smooth_drive, self.drive, 0.0015);
-            slew(&mut self.smooth_mix, self.mix, 0.0015);
-            slew(&mut self.smooth_tube_comp, self.tube_comp, 0.0015);
-            slew(&mut self.smooth_fuzz_comp, self.fuzz_comp, 0.0015);
-        }
-        let mut l = self.shape(input.left, 0);
-        let mut r = self.shape(input.right, 1);
-        if self.xfade > 0 {
-            // Type-switch crossfade (~1.5 ms): blend the old topology's
-            // output in so switching Tube→Fuzz mid-note doesn't step.
-            self.xfade -= 1;
-            let t = self.xfade as f32 * (1.0 / 64.0);
-            l += (self.shape_as(self.prev_type, input.left, 0) - l) * t;
-            r += (self.shape_as(self.prev_type, input.right, 1) - r) * t;
-        }
+        let l = self.shape(input.left, 0);
+        let r = self.shape(input.right, 1);
         StereoSample::new(
-            input.left * (1.0 - self.smooth_mix) + l * self.smooth_mix,
-            input.right * (1.0 - self.smooth_mix) + r * self.smooth_mix,
+            input.left * (1.0 - self.mix) + l * self.mix,
+            input.right * (1.0 - self.mix) + r * self.mix,
         )
     }
 
@@ -815,9 +732,7 @@ impl Distortion {
     }
     pub fn set_type(&mut self, dtype: DistortionType) {
         if dtype != self.dtype {
-            self.prev_type = self.dtype;
             self.dtype = dtype;
-            self.xfade = 64;
             self.bc_count = [0; 2];
             self.bc_held = [0.0; 2];
         }
@@ -847,13 +762,6 @@ pub struct EffectsChain {
     pub delay_enabled: bool,
     pub reverb_enabled: bool,
     pub chorus_enabled: bool,
-    /// Per-stage bypass crossfade gates (0 = bypassed, 1 = active). The
-    /// `*_enabled` flags are the targets; the gates converge per sample so
-    /// stomping an effect on/off mid-audio fades instead of hard-switching.
-    gate_dist: f32,
-    gate_cho: f32,
-    gate_del: f32,
-    gate_rev: f32,
 }
 
 impl EffectsChain {
@@ -867,10 +775,6 @@ impl EffectsChain {
             delay_enabled: false,
             reverb_enabled: false,
             chorus_enabled: false,
-            gate_dist: 0.0,
-            gate_cho: 0.0,
-            gate_del: 0.0,
-            gate_rev: 0.0,
         }
     }
 
@@ -893,62 +797,10 @@ impl EffectsChain {
     /// Process stereo signal through effects chain
     #[link_section = ".iram1.text"]
     pub fn process_stereo(&mut self, input: StereoSample) -> StereoSample {
-        // Converge each bypass gate toward its enable flag (~11 ms). A stage
-        // keeps processing while its gate is above ~-60 dB, then the state
-        // buffers are reset once silent so re-enabling starts clean. Gates
-        // snap to the target once close so the steady state is an exact
-        // fixed point and the updates below can be skipped wholesale.
-        let d_target = self.distortion_enabled as u8 as f32;
-        let c_target = self.chorus_enabled as u8 as f32;
-        let l_target = self.delay_enabled as u8 as f32;
-        let r_target = self.reverb_enabled as u8 as f32;
-        if self.gate_dist != d_target
-            || self.gate_cho != c_target
-            || self.gate_del != l_target
-            || self.gate_rev != r_target
-        {
-            self.gate_dist += 0.002 * (d_target - self.gate_dist);
-            self.gate_cho += 0.002 * (c_target - self.gate_cho);
-            self.gate_del += 0.002 * (l_target - self.gate_del);
-            self.gate_rev += 0.002 * (r_target - self.gate_rev);
-            if (d_target - self.gate_dist).abs() < 0.001 {
-                self.gate_dist = d_target;
-            }
-            if (c_target - self.gate_cho).abs() < 0.001 {
-                self.gate_cho = c_target;
-            }
-            // When a delay/reverb gate decays below ~-60 dB, snap it fully
-            // to zero and clear its buffers ONCE — never fill buffers on
-            // every silent sample, but don't leave a stale tail for the
-            // next enable either.
-            if l_target == 0.0 && self.gate_del < 0.001 {
-                if self.gate_del != 0.0 {
-                    self.gate_del = 0.0;
-                    self.delay.reset();
-                }
-            } else if (l_target - self.gate_del).abs() < 0.001 {
-                self.gate_del = l_target;
-            }
-            if r_target == 0.0 && self.gate_rev < 0.001 {
-                if self.gate_rev != 0.0 {
-                    self.gate_rev = 0.0;
-                    self.reverb.reset();
-                }
-            } else if (r_target - self.gate_rev).abs() < 0.001 {
-                self.gate_rev = r_target;
-            }
-            if c_target == 0.0 && self.gate_cho < 0.001 {
-                if self.gate_cho != 0.0 {
-                    self.gate_cho = 0.0;
-                    self.chorus.reset();
-                }
-            }
-        }
-
-        if self.gate_dist < 1e-3
-            && self.gate_cho < 1e-3
-            && self.gate_del < 1e-3
-            && self.gate_rev < 1e-3
+        if !self.distortion_enabled
+            && !self.chorus_enabled
+            && !self.delay_enabled
+            && !self.reverb_enabled
         {
             return input;
         }
@@ -957,26 +809,19 @@ impl EffectsChain {
         // subnormal software traps on Xtensa.
         let mut output = StereoSample::new(input.left + 1e-19, input.right - 1e-19);
 
-        // Process in order: Distortion → Chorus → Delay → Reverb. Gates at
-        // ~1 take the direct path; mid-fade gates blend dry/wet; zero gates
-        // (already snapped + reset above) skip the stage entirely.
-        macro_rules! gated {
-            ($gate:expr, $fx:expr) => {
-                if $gate >= 0.999 {
-                    output = $fx.process_stereo(output);
-                } else if $gate > 1e-3 {
-                    let wet = $fx.process_stereo(output);
-                    output = StereoSample::new(
-                        output.left + (wet.left - output.left) * $gate,
-                        output.right + (wet.right - output.right) * $gate,
-                    );
-                }
-            };
+        // Process in order: Distortion → Chorus → Delay → Reverb
+        if self.distortion_enabled {
+            output = self.distortion.process_stereo(output);
         }
-        gated!(self.gate_dist, self.distortion);
-        gated!(self.gate_cho, self.chorus);
-        gated!(self.gate_del, self.delay);
-        gated!(self.gate_rev, self.reverb);
+        if self.chorus_enabled {
+            output = self.chorus.process_stereo(output);
+        }
+        if self.delay_enabled {
+            output = self.delay.process_stereo(output);
+        }
+        if self.reverb_enabled {
+            output = self.reverb.process_stereo(output);
+        }
 
         output
     }

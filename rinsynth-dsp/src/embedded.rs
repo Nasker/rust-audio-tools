@@ -51,10 +51,6 @@ const MAX_OSCS: usize = 4;
 const OSC_GAIN: f32 = 0.085;
 /// Mono-mode key stack capacity (last-note priority, newest on top).
 const KEY_STACK_CAP: usize = 16;
-/// Per-sample decrement of the waveform-swap dip ramp — a full fade-out +
-/// fade-in on one oscillator spans ~2.9 ms @ 44.1 kHz, masking the
-/// discontinuity of switching shapes mid-note.
-const WF_DIP_STEP: f32 = 1.0 / 64.0;
 
 /// Cycle-count a pipeline stage when a profiler hook is installed; a single
 /// predictable branch per call otherwise.
@@ -176,10 +172,6 @@ struct TptSvf {
     k: f32,
     in_gain: f32,
     mode: FilterMode,
-    /// Previous output mode during a mode-switch crossfade.
-    prev_mode: FilterMode,
-    /// Remaining mode-crossfade samples (0 = fade complete).
-    xfade: u8,
     ic1: [f32; 2],
     ic2: [f32; 2],
 }
@@ -193,8 +185,6 @@ impl TptSvf {
             k: 2.0,
             in_gain: 1.0,
             mode: FilterMode::LowPass,
-            prev_mode: FilterMode::LowPass,
-            xfade: 0,
             ic1: [0.0; 2],
             ic2: [0.0; 2],
         }
@@ -224,24 +214,7 @@ impl TptSvf {
         // Input headroom compensation at high Q so low-frequency fundamentals
         // hitting the resonant peak don't overdrive the voice budget.
         self.in_gain = 1.0 / (1.0 + 1.1 * r * r);
-        if mode != self.mode {
-            self.prev_mode = self.mode;
-            self.xfade = 64; // ~1.5 ms crossfade between mode outputs
-        }
         self.mode = mode;
-    }
-
-    /// Filter output for a given mode — a linear combo of the resonator
-    /// states already computed in `process`, so evaluating both modes during
-    /// a switch crossfade costs only a few extra muls.
-    #[inline(always)]
-    fn mode_out(mode: FilterMode, xin: f32, k: f32, v1: f32, v2: f32) -> f32 {
-        match mode {
-            FilterMode::LowPass => v2,
-            FilterMode::BandPass => v1,
-            FilterMode::HighPass => xin - k * v1 - v2,
-            FilterMode::Notch => xin - k * v1,
-        }
     }
 
     #[inline(always)]
@@ -265,14 +238,11 @@ impl TptSvf {
         }
         self.ic1[ch] = ic1;
         self.ic2[ch] = ic2;
-        let out = Self::mode_out(self.mode, xin, self.k, v1, v2);
-        if self.xfade > 0 {
-            self.xfade -= 1;
-            let old = Self::mode_out(self.prev_mode, xin, self.k, v1, v2);
-            let t = self.xfade as f32 * (1.0 / 64.0);
-            out + (old - out) * t
-        } else {
-            out
+        match self.mode {
+            FilterMode::LowPass => v2,
+            FilterMode::BandPass => v1,
+            FilterMode::HighPass => xin - self.k * v1 - v2,
+            FilterMode::Notch => xin - self.k * v1,
         }
     }
 }
@@ -296,11 +266,9 @@ pub struct LeanVoice {
     osc_level: [f32; MAX_OSCS],
     osc_pan: [f32; MAX_OSCS],
     osc_pw: [f32; MAX_OSCS],
-    smooth_pw: [f32; MAX_OSCS],
     osc_semi: [i8; MAX_OSCS],
     osc_cents: [i8; MAX_OSCS],
     detune: [f32; MAX_OSCS],
-    target_detune: [f32; MAX_OSCS],
     amp_env: ADSREnvelope,
     fenv: ADSREnvelope,
     env3: ADSREnvelope,
@@ -308,19 +276,14 @@ pub struct LeanVoice {
     /// release for a fast fade; `note_on` restores this value.
     cfgd_release: f32,
     fenv_amount: f32,
-    /// Smoothed Env Amount — the raw value scales the audio-rate fenv
-    /// output, so a slider step would jump the cutoff while the env is hot.
-    smooth_fenv_amt: f32,
     filter: TptSvf,
     filter_mode: FilterMode,
     /// Wide-open lowpass with ~no resonance is audibly transparent — skip the
     /// per-sample TPT state update entirely. Evaluated each control tick.
     filter_bypass: bool,
     resonance: f32, // 0.0..1.0
-    smooth_reso: f32,
     base_cutoff: Frequency,
     smooth_cutoff: Frequency,
-    smooth_cutoff_oct: f32,
     lfo: LFO,
     lfo2: LFO,
     lfo_rate: f32,
@@ -342,47 +305,15 @@ pub struct LeanVoice {
     env3_amp: f32,
     /// Audio-rate FM amount from Osc4 -> Osc1/AllPitch
     osc4_fm: f32,
-    target_osc4_fm: f32,
-    osc4_fm_step: f32,
     /// Audio-rate Ring-Mod amount from Osc4 -> Osc1Level/Amplitude
     osc4_rm: f32,
-    target_osc4_rm: f32,
-    osc4_rm_step: f32,
-    /// Pending waveform swap per osc (0xFF = none) — dips that osc's output
-    /// to silence over ~64 samples, swaps the shape, then fades back in.
-    wf_pending: [u8; MAX_OSCS],
-    wf_fade: [f32; MAX_OSCS],
-    /// Smoothed whole-voice pitch offset in semitones (bend + LFO/matrix).
-    smooth_pitch: f32,
-    /// Smoothed per-osc pitch offsets in semitones (matrix Osc*Pitch).
-    smooth_osc_pitch: [f32; MAX_OSCS],
     /// Unison pitch multiplier (mono-mode voice stacking) — folded into
     /// `set_osc_freqs`; 1.0 for a plain poly/mono voice.
     uni_mul: f32,
-    target_uni_mul: f32,
     /// Unison stereo gain pair applied to the voice output — includes the
     /// 1/sqrt(n) loudness compensation so a unison stack doesn't slam the
     /// bus compressor. (1.0, 1.0) = unity stereo.
     uni_gain: (f32, f32),
-    uni_gain_step: (f32, f32),
-    target_uni_gain: (f32, f32),
-    /// Bitmask of oscillators that may emit audio this control block
-    /// (bit i = osc i renders) — recomputed each control tick so the
-    /// per-sample osc gate is a single bit test.
-    osc_live: u8,
-    /// Any ramp steps currently nonzero — when false, the per-sample
-    /// gain/amp/fm/rm additions are exact no-ops and get skipped wholesale.
-    ramping: bool,
-    /// Any waveform dip in progress or pending — skips the fade mul + state
-    /// machine on the (overwhelmingly common) steady-state path.
-    wf_fading: bool,
-    /// Last inputs pushed into `filter.set` — the powf/sin_cos/divide chain
-    /// is skipped while all three hold still (see control_tick).
-    last_oct: f32,
-    last_reso: f32,
-    /// Effective cutoff from the last `filter.set` — reused by the bypass
-    /// evaluation on ticks where coefficients aren't recomputed.
-    last_cutoff: Frequency,
     sample_rate: SampleRate,
 }
 
@@ -402,25 +333,20 @@ impl LeanVoice {
             osc_level: [0.0; MAX_OSCS],
             osc_pan: [0.0; MAX_OSCS],
             osc_pw: [0.5; MAX_OSCS],
-            smooth_pw: [0.5; MAX_OSCS],
             osc_semi: [0, 0, -12, 0],
             osc_cents: [0, 7, 0, 0],
             detune: [1.0; MAX_OSCS],
-            target_detune: [1.0; MAX_OSCS],
             amp_env: ADSREnvelope::new(0.01, 0.1, 0.7, 0.2, sample_rate),
             fenv: ADSREnvelope::new(0.01, 0.3, 0.0, 0.3, sample_rate),
             env3: ADSREnvelope::new(0.01, 0.3, 0.0, 0.3, ctrl_sr),
             cfgd_release: 0.2,
             fenv_amount: 0.0,
-            smooth_fenv_amt: 0.0,
             filter: TptSvf::new(),
             filter_mode: FilterMode::LowPass,
             filter_bypass: false,
             resonance: 0.2,
-            smooth_reso: 0.2,
             base_cutoff: 8000.0,
             smooth_cutoff: 8000.0,
-            smooth_cutoff_oct: 0.0,
             lfo: LFO::new(ctrl_sr),
             lfo2: LFO::new(ctrl_sr),
             lfo_rate: 4.0,
@@ -441,26 +367,9 @@ impl LeanVoice {
             fenv_amp: 0.0,
             env3_amp: 0.0,
             osc4_fm: 0.0,
-            target_osc4_fm: 0.0,
-            osc4_fm_step: 0.0,
             osc4_rm: 0.0,
-            target_osc4_rm: 0.0,
-            osc4_rm_step: 0.0,
-            wf_pending: [0xFF; MAX_OSCS],
-            wf_fade: [1.0; MAX_OSCS],
-            smooth_pitch: 0.0,
-            smooth_osc_pitch: [0.0; MAX_OSCS],
             uni_mul: 1.0,
-            target_uni_mul: 1.0,
             uni_gain: (1.0, 1.0),
-            uni_gain_step: (0.0, 0.0),
-            target_uni_gain: (1.0, 1.0),
-            osc_live: 0,
-            ramping: false,
-            wf_fading: false,
-            last_oct: 1e30,
-            last_reso: 1e30,
-            last_cutoff: 20000.0,
             sample_rate,
         }
     }
@@ -492,36 +401,6 @@ impl LeanVoice {
         }
     }
 
-    /// Change an oscillator's waveform without a click: an active voice dips
-    /// that osc to silence over ~64 samples (`step_wf_fade` swaps the shape
-    /// at the bottom), an idle voice switches immediately.
-    fn set_osc_waveform(&mut self, i: usize, wf: WaveformType) {
-        if self.active && self.oscs[i].kind != wf {
-            self.wf_pending[i] = wf as u8;
-            self.wf_fading = true;
-        } else {
-            self.oscs[i].kind = wf;
-        }
-    }
-
-    /// Per-sample waveform-dip state machine for `set_osc_waveform`.
-    #[inline(always)]
-    fn step_wf_fade(&mut self, i: usize) {
-        if self.wf_pending[i] != 0xFF {
-            self.wf_fade[i] -= WF_DIP_STEP;
-            if self.wf_fade[i] <= 0.0 {
-                self.oscs[i].kind = WaveformType::from_index(self.wf_pending[i]);
-                self.wf_pending[i] = 0xFF;
-                self.wf_fade[i] = 0.0;
-                // The gain taper is waveform-dependent (Noise uses x^2) —
-                // refresh targets so the fade-in lands on the right level.
-                self.update_gains();
-            }
-        } else if self.wf_fade[i] < 1.0 {
-            self.wf_fade[i] = (self.wf_fade[i] + WF_DIP_STEP).min(1.0);
-        }
-    }
-
     fn note_on(&mut self, note: MidiNote, velocity: Amplitude, portamento: f32, age: u64) {
         let was_active = self.active && self.amp_env.state() != EnvelopeState::Idle;
         let freq = midi_to_frequency(note);
@@ -544,43 +423,9 @@ impl LeanVoice {
         if !was_active {
             self.gains = self.target_gains;
             self.gain_steps = [(0.0, 0.0); MAX_OSCS];
-            self.smooth_pw = self.osc_pw;
-            self.detune = self.target_detune;
-            self.uni_mul = self.target_uni_mul;
-            self.uni_gain = self.target_uni_gain;
-            self.uni_gain_step = (0.0, 0.0);
             self.amp_lfo = 1.0;
             self.amp_lfo_step = 0.0;
             self.smooth_cutoff = self.base_cutoff;
-            self.smooth_cutoff_oct = 0.0;
-            self.smooth_reso = self.resonance;
-            self.smooth_pitch = 0.0;
-            self.smooth_osc_pitch = [0.0; MAX_OSCS];
-            self.smooth_fenv_amt = self.fenv_amount;
-            self.osc4_fm = self.target_osc4_fm;
-            self.osc4_rm = self.target_osc4_rm;
-            self.osc4_fm_step = 0.0;
-            self.osc4_rm_step = 0.0;
-            self.ramping = false;
-            self.last_oct = 1e30;
-            self.last_reso = 1e30;
-            let mut live = 0u8;
-            for i in 0..MAX_OSCS {
-                if self.target_gains[i].0 > 0.0 || self.target_gains[i].1 > 0.0 {
-                    live |= 1 << i;
-                }
-            }
-            if self.osc4_fm != 0.0 || self.osc4_rm != 0.0 {
-                live |= 1 << 3;
-            }
-            self.osc_live = live;
-            self.wf_fade = [1.0; MAX_OSCS];
-            for i in 0..MAX_OSCS {
-                if self.wf_pending[i] != 0xFF {
-                    self.oscs[i].kind = WaveformType::from_index(self.wf_pending[i]);
-                    self.wf_pending[i] = 0xFF;
-                }
-            }
             self.amp_env.reset();
             self.fenv.reset();
             self.env3.reset();
@@ -668,6 +513,7 @@ impl LeanVoice {
         let mut pan_off = [0.0f32; MAX_OSCS];
         let mut pw_off = [0.0f32; MAX_OSCS];
         let mut gains_dirty = false;
+        let mut pw_dirty = false;
 
         if !active_slots.is_empty() {
             let key_track = ((self.note as f32 - 60.0) / 60.0).clamp(-1.0, 1.0);
@@ -721,9 +567,18 @@ impl LeanVoice {
                         pan_off[2] += v;
                         gains_dirty = true;
                     }
-                    ModDest::Osc1Pw => pw_off[0] += v,
-                    ModDest::Osc2Pw => pw_off[1] += v,
-                    ModDest::Osc3Pw => pw_off[2] += v,
+                    ModDest::Osc1Pw => {
+                        pw_off[0] += v;
+                        pw_dirty = true;
+                    }
+                    ModDest::Osc2Pw => {
+                        pw_off[1] += v;
+                        pw_dirty = true;
+                    }
+                    ModDest::Osc3Pw => {
+                        pw_off[2] += v;
+                        pw_dirty = true;
+                    }
                     ModDest::Lfo1Rate => {
                         self.lfo
                             .set_rate((self.lfo_rate * 2.0f32.powf(v * 3.0)).clamp(0.05, 30.0));
@@ -744,104 +599,29 @@ impl LeanVoice {
         // (with a 0.45 one-pole slew filter so even Square/Saw LFO edges glide
         // over ~3 ms instead of snapping, and Sine/Tri LFOs on Pan/Level never
         // produce 689 Hz control-rate staircase "shizzle").
-        let mut pw_dirty = false;
-        let mut detune_dirty = false;
         for i in 0..MAX_OSCS {
             let dl = 0.45 * (self.target_gains[i].0 - self.gains[i].0);
             let dr = 0.45 * (self.target_gains[i].1 - self.gains[i].1);
             self.gain_steps[i] = (dl * INV_CONTROL_DIV, dr * INV_CONTROL_DIV);
-
-            // Smooth pulse-width and fine detune (cents/semitones) across
-            // control ticks so slider drags and PWM never click.
-            let target_pw = (self.osc_pw[i] + pw_off[i]).clamp(0.01, 0.99);
-            self.smooth_pw[i] += 0.25 * (target_pw - self.smooth_pw[i]);
-            if (target_pw - self.smooth_pw[i]).abs() > 1e-6 {
-                pw_dirty = true;
-            }
-            self.detune[i] += 0.25 * (self.target_detune[i] - self.detune[i]);
-            if (self.target_detune[i] - self.detune[i]).abs() > 1e-7 {
-                detune_dirty = true;
-            }
         }
         if pw_dirty {
             for i in 0..MAX_OSCS {
-                self.oscs[i].set_duty(self.smooth_pw[i]);
+                self.oscs[i].set_duty(self.osc_pw[i] + pw_off[i]);
             }
         }
-        self.uni_mul += 0.25 * (self.target_uni_mul - self.uni_mul);
-        let uni_dirty = (self.target_uni_mul - self.uni_mul).abs() > 1e-7;
-        let udl = 0.45 * (self.target_uni_gain.0 - self.uni_gain.0);
-        let udr = 0.45 * (self.target_uni_gain.1 - self.uni_gain.1);
-        self.uni_gain_step = (udl * INV_CONTROL_DIV, udr * INV_CONTROL_DIV);
 
-        // Osc4 audio-rate FM/RM depths ramp per sample like amp_lfo.
-        self.osc4_fm_step = 0.45 * (self.target_osc4_fm - self.osc4_fm) * INV_CONTROL_DIV;
-        self.osc4_rm_step = 0.45 * (self.target_osc4_rm - self.osc4_rm) * INV_CONTROL_DIV;
+        self.set_osc_freqs(bend_semitones + all_pitch_semi, osc_pitch_semi);
 
-        // Smooth pitch offsets (bend + LFO/matrix pitch) at ~0.5 pole per
-        // tick: pitch bend and vibrato stay clean while tracking stays fast.
-        let target_pitch = bend_semitones + all_pitch_semi;
-        self.smooth_pitch += 0.5 * (target_pitch - self.smooth_pitch);
-        let mut pitch_dirty = (target_pitch - self.smooth_pitch).abs() > 1e-7;
-        for i in 0..MAX_OSCS {
-            self.smooth_osc_pitch[i] += 0.5 * (osc_pitch_semi[i] - self.smooth_osc_pitch[i]);
-            if (osc_pitch_semi[i] - self.smooth_osc_pitch[i]).abs() > 1e-7 {
-                pitch_dirty = true;
-            }
-        }
-        // Only pay for the powf/divides in set_osc_freqs while a pitch input
-        // is actually moving — sustained notes re-derive identical incs.
-        if pitch_dirty || detune_dirty || uni_dirty {
-            self.set_osc_freqs(self.smooth_pitch, self.smooth_osc_pitch);
-        }
-        // Bitmask of oscillators that may emit audio next block — one bit
-        // test per osc per sample instead of re-reading all the gain fields.
-        let mut live = 0u8;
-        for i in 0..MAX_OSCS {
-            if self.gains[i].0 > 1e-6
-                || self.gains[i].1 > 1e-6
-                || self.target_gains[i].0 > 0.0
-                || self.target_gains[i].1 > 0.0
-                || self.wf_pending[i] != 0xFF
-            {
-                live |= 1 << i;
-            }
-        }
-        if self.osc4_fm != 0.0
-            || self.osc4_rm != 0.0
-            || self.target_osc4_fm != 0.0
-            || self.target_osc4_rm != 0.0
-        {
-            live |= 1 << 3;
-        }
-        self.osc_live = live;
-
-        // Smooth base_cutoff, cutoff modulation, and resonance at control rate
-        // to prevent staircase clicks when sweeping filter sliders/knobs.
-        // The filter envelope itself runs at audio rate upstream, so only the
-        // control-rate offsets are smoothed — fenv attack stays crisp.
+        // Smooth base_cutoff at control rate to prevent staircase clicks when
+        // sweeping the cutoff slider/knob.
         self.smooth_cutoff += 0.22 * (self.base_cutoff - self.smooth_cutoff);
-        self.smooth_fenv_amt += 0.25 * (self.fenv_amount - self.smooth_fenv_amt);
-        let env_sweep = 6.0 * self.smooth_fenv_amt * self.fenv_amp;
-        self.smooth_cutoff_oct += 0.35 * (cutoff_oct - self.smooth_cutoff_oct);
+        // Filter env: 6-octave sweep at full amount (matches the rich engine)
+        let env_sweep = 6.0 * self.fenv_amount * self.fenv_amp;
+        let cutoff = (self.smooth_cutoff * 2.0f32.powf(env_sweep + cutoff_oct))
+            .clamp(25.0, self.sample_rate as f32 * 0.42);
         let eff_reso = (self.resonance + reso_off).clamp(0.0, 1.0);
-        self.smooth_reso += 0.22 * (eff_reso - self.smooth_reso);
-        // Only pay for the powf + sin_cos + divides in filter.set while a
-        // coefficient input is actually moving (or the mode changed) —
-        // sustained notes re-derive identical coefficients otherwise.
-        let oct_total = env_sweep + self.smooth_cutoff_oct;
-        if (oct_total - self.last_oct).abs() > 1e-7
-            || (self.smooth_reso - self.last_reso).abs() > 1e-7
-            || self.filter.mode != self.filter_mode
-        {
-            self.last_oct = oct_total;
-            self.last_reso = self.smooth_reso;
-            let cutoff = (self.smooth_cutoff * 2.0f32.powf(oct_total))
-                .clamp(25.0, self.sample_rate as f32 * 0.42);
-            self.last_cutoff = cutoff;
-            self.filter
-                .set(self.filter_mode, cutoff, self.smooth_reso, self.sample_rate);
-        }
+        self.filter
+            .set(self.filter_mode, cutoff, eff_reso, self.sample_rate);
         // Bypass the per-sample SVF when it would be a no-op audibly:
         // lowpass, cutoff pinned at the top clamp, ~no resonance — AND no
         // modulator currently able to pull it back down. apply_preset
@@ -859,9 +639,8 @@ impl LeanVoice {
                     && s.amount.abs() > 0.01
             });
         let bypass = self.filter_mode == FilterMode::LowPass
-            && self.smooth_reso < 0.01
-            && self.last_cutoff >= self.sample_rate as f32 * 0.42 * 0.999
-            && self.filter.xfade == 0
+            && eff_reso < 0.01
+            && cutoff >= self.sample_rate as f32 * 0.42 * 0.999
             && !filter_modulated;
         if self.filter_bypass && !bypass {
             self.filter.reset();
@@ -870,17 +649,6 @@ impl LeanVoice {
 
         let target_amp_lfo = (1.0 + amp_mod).clamp(0.0, 2.0);
         self.amp_lfo_step = 0.45 * (target_amp_lfo - self.amp_lfo) * INV_CONTROL_DIV;
-
-        // Per-sample fast-path flags: with all steps converged the ramp adds
-        // are exact no-ops, so the hot loop can skip them and their write-back.
-        self.ramping = self.gain_steps.iter().any(|s| s.0 != 0.0 || s.1 != 0.0)
-            || self.uni_gain_step.0 != 0.0
-            || self.uni_gain_step.1 != 0.0
-            || self.osc4_fm_step != 0.0
-            || self.osc4_rm_step != 0.0
-            || self.amp_lfo_step != 0.0;
-        self.wf_fading = self.wf_fade.iter().any(|f| *f < 1.0)
-            || self.wf_pending.iter().any(|p| *p != 0xFF);
     }
 
     #[link_section = ".iram1.text"]
@@ -926,38 +694,20 @@ impl LeanVoice {
         let mut l = 0.0f32;
         let mut r = 0.0f32;
         let _osct = profile::now();
-        // Hoist per-sample ramp state into locals: the `&mut oscs[i]` borrows
-        // in the loop otherwise force a load+store round-trip on every gain
-        // field every sample. `osc_live` is a bitmask refreshed at each
-        // control tick — one bit test per osc instead of a 5-way OR over
-        // gain/pending fields. When `ramping` is false all steps are exact
-        // zeros and the adds/write-back are skipped wholesale.
-        let live = self.osc_live;
-        let fading = self.wf_fading;
-        let mut gs = self.gains;
-        if self.ramping {
-            let st = self.gain_steps;
-            for i in 0..MAX_OSCS {
-                gs[i].0 += st[i].0;
-                gs[i].1 += st[i].1;
-            }
-            self.gains = gs;
-            self.osc4_fm += self.osc4_fm_step;
-            self.osc4_rm += self.osc4_rm_step;
-            self.amp_lfo += self.amp_lfo_step;
-            self.uni_gain.0 += self.uni_gain_step.0;
-            self.uni_gain.1 += self.uni_gain_step.1;
-        }
         // Advance Osc 4 first when active (either audible or routed as an
         // audio-rate FM / Ring-Mod source in the mod matrix).
-        let s4 = if live & (1 << 3) != 0 {
-            let mut v = self.oscs[3].next();
-            if fading {
-                v *= self.wf_fade[3];
-                self.step_wf_fade(3);
-            }
-            l += v * gs[3].0;
-            r += v * gs[3].1;
+        let s4 = if self.gains[3].0 > 1e-6
+            || self.gains[3].1 > 1e-6
+            || self.target_gains[3].0 > 0.0
+            || self.target_gains[3].1 > 0.0
+            || self.osc4_fm != 0.0
+            || self.osc4_rm != 0.0
+        {
+            self.gains[3].0 += self.gain_steps[3].0;
+            self.gains[3].1 += self.gain_steps[3].1;
+            let v = self.oscs[3].next();
+            l += v * self.gains[3].0;
+            r += v * self.gains[3].1;
             if self.osc4_fm != 0.0 {
                 let mut p = self.oscs[0].phase + v * self.osc4_fm * self.oscs[0].inc * 4.0;
                 if p >= 1.0 {
@@ -977,15 +727,17 @@ impl LeanVoice {
             1.0
         };
         for i in 0..3 {
-            if live & (1 << i) != 0 {
-                let mut s = self.oscs[i].next();
-                if fading {
-                    s *= self.wf_fade[i];
-                    self.step_wf_fade(i);
-                }
+            if self.gains[i].0 > 1e-6
+                || self.gains[i].1 > 1e-6
+                || self.target_gains[i].0 > 0.0
+                || self.target_gains[i].1 > 0.0
+            {
+                self.gains[i].0 += self.gain_steps[i].0;
+                self.gains[i].1 += self.gain_steps[i].1;
+                let s = self.oscs[i].next();
                 let m = if i == 0 { rm_gain } else { 1.0 };
-                l += s * gs[i].0 * m;
-                r += s * gs[i].1 * m;
+                l += s * self.gains[i].0 * m;
+                r += s * self.gains[i].1 * m;
             }
         }
         if profile::enabled() {
@@ -1001,6 +753,7 @@ impl LeanVoice {
         if profile::enabled() {
             profile::add(profile::FILTER, profile::now() - _ft);
         }
+        self.amp_lfo += self.amp_lfo_step;
         let g = amp * self.velocity * self.amp_lfo;
         StereoSample::new(fl * g * self.uni_gain.0, fr * g * self.uni_gain.1)
     }
@@ -1036,9 +789,6 @@ pub struct EmbeddedEngine {
     unison_spread: f32,
     age_counter: u64,
     stereo_width: f32,
-    /// Per-sample smoothed stereo width — moving the Width slider/CC steps
-    /// the mid/side gain instantly otherwise.
-    smooth_width: f32,
     voice_cap: usize,     // effective polyphony cap (CPU governor / user limit)
     bpm: f32,             // tempo in BPM (20..300) for synced LFOs and delay
     lfo1_rate: f32,       // unsynced LFO1 rate in Hz
@@ -1073,7 +823,6 @@ impl EmbeddedEngine {
             unison_spread: 0.7,
             age_counter: 0,
             stereo_width: 1.0,
-            smooth_width: 1.0,
             voice_cap: max_voices,
             bpm: 120.0,
             lfo1_rate: 4.0,
@@ -1173,10 +922,10 @@ impl EmbeddedEngine {
             } else {
                 0.0
             };
-            v.target_uni_mul = 2.0f32.powf(off * det / 1200.0);
+            v.uni_mul = 2.0f32.powf(off * det / 1200.0);
             // Linear pan taper on an already-stereo voice (centre = unity).
             let pan = off * spr;
-            v.target_uni_gain = (
+            v.uni_gain = (
                 (1.0 - pan.max(0.0)) * comp,
                 (1.0 + pan.min(0.0)) * comp,
             );
@@ -1333,13 +1082,12 @@ impl EmbeddedEngine {
         }
         self.num_active_slots = n;
         for v in &mut self.voices {
-            v.target_osc4_fm = fm;
-            v.target_osc4_rm = rm;
-            if !v.active {
-                v.osc4_fm = fm;
-                v.osc4_rm = rm;
-            }
+            v.osc4_fm = fm;
+            v.osc4_rm = rm;
             v.update_gains();
+            for i in 0..MAX_OSCS {
+                v.oscs[i].set_duty(v.osc_pw[i]);
+            }
         }
     }
 
@@ -1541,10 +1289,14 @@ impl EmbeddedEngine {
         let eff_lfo2_rate = self.effective_lfo2_rate();
 
         for v in &mut self.voices {
-            v.set_osc_waveform(0, preset.osc1_waveform);
-            v.set_osc_waveform(1, preset.osc2_waveform);
-            v.set_osc_waveform(2, preset.osc3_waveform);
-            v.set_osc_waveform(3, preset.osc4_waveform);
+            v.oscs[0].kind = preset.osc1_waveform;
+            v.oscs[0].set_duty(preset.osc1_pw);
+            v.oscs[1].kind = preset.osc2_waveform;
+            v.oscs[1].set_duty(preset.osc2_pw);
+            v.oscs[2].kind = preset.osc3_waveform;
+            v.oscs[2].set_duty(preset.osc3_pw);
+            v.oscs[3].kind = preset.osc4_waveform;
+            v.oscs[3].set_duty(preset.osc4_pw);
             v.osc_pw = [preset.osc1_pw, preset.osc2_pw, preset.osc3_pw, preset.osc4_pw];
             v.osc_level = [
                 preset.osc1_level,
@@ -1565,7 +1317,7 @@ impl EmbeddedEngine {
                 preset.osc4_semitones,
             ];
             v.osc_cents = [0, preset.osc2_cents, preset.osc3_cents, preset.osc4_cents];
-            v.target_detune = [
+            v.detune = [
                 1.0,
                 super::oscillator::detune_ratio(preset.osc2_semitones, preset.osc2_cents),
                 super::oscillator::detune_ratio(preset.osc3_semitones, preset.osc3_cents),
@@ -1589,16 +1341,10 @@ impl EmbeddedEngine {
             v.env3.set_release(preset.env3_release);
             v.fenv_amount = preset.filter_env_amount;
             v.base_cutoff = preset.filter_cutoff;
-            v.resonance = reso;
             if !v.active {
                 v.smooth_cutoff = preset.filter_cutoff;
-                v.smooth_reso = reso;
-                v.smooth_pw = v.osc_pw;
-                v.detune = v.target_detune;
-                for i in 0..MAX_OSCS {
-                    v.oscs[i].set_duty(v.smooth_pw[i]);
-                }
             }
+            v.resonance = reso;
             v.lfo_rate = eff_lfo1_rate;
             v.lfo.set_rate(eff_lfo1_rate);
             v.lfo_depth = preset.lfo_depth;
@@ -1737,7 +1483,7 @@ impl EmbeddedEngine {
             SynthParam::Osc1Waveform => {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
-                    v.set_osc_waveform(0, wf);
+                    v.oscs[0].kind = wf;
                     v.update_gains();
                 }
             }
@@ -1751,10 +1497,7 @@ impl EmbeddedEngine {
             SynthParam::Osc1Pw => {
                 for v in &mut self.voices {
                     v.osc_pw[0] = plain;
-                    if !v.active {
-                        v.smooth_pw[0] = plain;
-                        v.oscs[0].set_duty(plain);
-                    }
+                    v.oscs[0].set_duty(plain);
                 }
             }
             SynthParam::Osc1Pan => {
@@ -1766,7 +1509,7 @@ impl EmbeddedEngine {
             SynthParam::Osc2Waveform => {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
-                    v.set_osc_waveform(1, wf);
+                    v.oscs[1].kind = wf;
                     v.update_gains();
                 }
             }
@@ -1781,31 +1524,20 @@ impl EmbeddedEngine {
                 let semi = plain.round() as i8;
                 for v in &mut self.voices {
                     v.osc_semi[1] = semi;
-                    v.target_detune[1] =
-                        super::oscillator::detune_ratio(v.osc_semi[1], v.osc_cents[1]);
-                    if !v.active {
-                        v.detune[1] = v.target_detune[1];
-                    }
+                    v.detune[1] = super::oscillator::detune_ratio(v.osc_semi[1], v.osc_cents[1]);
                 }
             }
             SynthParam::Osc2Cents => {
                 let cents = plain.round() as i8;
                 for v in &mut self.voices {
                     v.osc_cents[1] = cents;
-                    v.target_detune[1] =
-                        super::oscillator::detune_ratio(v.osc_semi[1], v.osc_cents[1]);
-                    if !v.active {
-                        v.detune[1] = v.target_detune[1];
-                    }
+                    v.detune[1] = super::oscillator::detune_ratio(v.osc_semi[1], v.osc_cents[1]);
                 }
             }
             SynthParam::Osc2Pw => {
                 for v in &mut self.voices {
                     v.osc_pw[1] = plain;
-                    if !v.active {
-                        v.smooth_pw[1] = plain;
-                        v.oscs[1].set_duty(plain);
-                    }
+                    v.oscs[1].set_duty(plain);
                 }
             }
             SynthParam::Osc2Pan => {
@@ -1817,7 +1549,7 @@ impl EmbeddedEngine {
             SynthParam::Osc3Waveform => {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
-                    v.set_osc_waveform(2, wf);
+                    v.oscs[2].kind = wf;
                     v.update_gains();
                 }
             }
@@ -1832,31 +1564,20 @@ impl EmbeddedEngine {
                 let semi = plain.round() as i8;
                 for v in &mut self.voices {
                     v.osc_semi[2] = semi;
-                    v.target_detune[2] =
-                        super::oscillator::detune_ratio(v.osc_semi[2], v.osc_cents[2]);
-                    if !v.active {
-                        v.detune[2] = v.target_detune[2];
-                    }
+                    v.detune[2] = super::oscillator::detune_ratio(v.osc_semi[2], v.osc_cents[2]);
                 }
             }
             SynthParam::Osc3Cents => {
                 let cents = plain.round() as i8;
                 for v in &mut self.voices {
                     v.osc_cents[2] = cents;
-                    v.target_detune[2] =
-                        super::oscillator::detune_ratio(v.osc_semi[2], v.osc_cents[2]);
-                    if !v.active {
-                        v.detune[2] = v.target_detune[2];
-                    }
+                    v.detune[2] = super::oscillator::detune_ratio(v.osc_semi[2], v.osc_cents[2]);
                 }
             }
             SynthParam::Osc3Pw => {
                 for v in &mut self.voices {
                     v.osc_pw[2] = plain;
-                    if !v.active {
-                        v.smooth_pw[2] = plain;
-                        v.oscs[2].set_duty(plain);
-                    }
+                    v.oscs[2].set_duty(plain);
                 }
             }
             SynthParam::Osc3Pan => {
@@ -1868,7 +1589,7 @@ impl EmbeddedEngine {
             SynthParam::Osc4Waveform => {
                 let wf = WaveformType::from_index(plain as u8);
                 for v in &mut self.voices {
-                    v.set_osc_waveform(3, wf);
+                    v.oscs[3].kind = wf;
                     v.update_gains();
                 }
             }
@@ -1883,31 +1604,20 @@ impl EmbeddedEngine {
                 let semi = plain.round() as i8;
                 for v in &mut self.voices {
                     v.osc_semi[3] = semi;
-                    v.target_detune[3] =
-                        super::oscillator::detune_ratio(v.osc_semi[3], v.osc_cents[3]);
-                    if !v.active {
-                        v.detune[3] = v.target_detune[3];
-                    }
+                    v.detune[3] = super::oscillator::detune_ratio(v.osc_semi[3], v.osc_cents[3]);
                 }
             }
             SynthParam::Osc4Cents => {
                 let cents = plain.round() as i8;
                 for v in &mut self.voices {
                     v.osc_cents[3] = cents;
-                    v.target_detune[3] =
-                        super::oscillator::detune_ratio(v.osc_semi[3], v.osc_cents[3]);
-                    if !v.active {
-                        v.detune[3] = v.target_detune[3];
-                    }
+                    v.detune[3] = super::oscillator::detune_ratio(v.osc_semi[3], v.osc_cents[3]);
                 }
             }
             SynthParam::Osc4Pw => {
                 for v in &mut self.voices {
                     v.osc_pw[3] = plain;
-                    if !v.active {
-                        v.smooth_pw[3] = plain;
-                        v.oscs[3].set_duty(plain);
-                    }
+                    v.oscs[3].set_duty(plain);
                 }
             }
             SynthParam::Osc4Pan => {
@@ -1939,8 +1649,8 @@ impl EmbeddedEngine {
                     PolyphonyMode::Poly => {
                         let idx = self.pick_voice(event.note);
                         let v = &mut self.voices[idx];
-                        v.target_uni_mul = 1.0;
-                        v.target_uni_gain = (1.0, 1.0);
+                        v.uni_mul = 1.0;
+                        v.uni_gain = (1.0, 1.0);
                         v.note_on(event.note, event.velocity, self.portamento, self.age_counter);
                     }
                 }
@@ -2063,28 +1773,14 @@ impl EmbeddedEngine {
             }
         }
         let mut out = StereoSample::new(l, r);
-        // Per-sample one-pole on stereo width — a stepped mid/side gain is an
-        // output discontinuity just like any other level jump. Snaps on
-        // converge so the compare-guard skips the update in steady state.
-        if self.smooth_width != self.stereo_width {
-            self.smooth_width += 0.002 * (self.stereo_width - self.smooth_width);
-            if (self.stereo_width - self.smooth_width).abs() < 1e-5 {
-                self.smooth_width = self.stereo_width;
-            }
-        }
-        if (self.smooth_width - 1.0).abs() > 1e-4 {
-            out = out.with_width(self.smooth_width);
+        if self.stereo_width != 1.0 {
+            out = out.with_width(self.stereo_width);
         }
         // Per-sample one-pole de-zipper on Master Volume (~15 ms time constant)
         // with an audio-taper makeup curve: 0.0 -> 0.0, 0.5 -> 0.56, 0.7 -> 0.89,
         // 1.0 -> 1.50 (+3.5 dB post-FX digital makeup gain before the DAC).
         let target_vol = Self::master_taper(self.master_volume);
-        if self.smooth_master_gain != target_vol {
-            self.smooth_master_gain += 0.0015 * (target_vol - self.smooth_master_gain);
-            if (target_vol - self.smooth_master_gain).abs() < 1e-5 {
-                self.smooth_master_gain = target_vol;
-            }
-        }
+        self.smooth_master_gain += 0.0015 * (target_vol - self.smooth_master_gain);
 
         if profile::enabled() {
             profile::add(profile::SAMPLES, 1);
@@ -2514,207 +2210,5 @@ mod tests {
         assert!(low_noise * 10.0 < low_saw, "low_noise={low_noise}, low_saw={low_saw}");
         // At 1.0, noise still reaches 65% of full oscillator scale
         assert!((max_noise - max_saw * 0.65).abs() < 1e-6);
-    }
-
-    /// Max |sample-to-sample| delta over `n` rendered samples — the metric a
-    /// listener hears as a click or scratch when a parameter steps.
-    fn max_step(e: &mut EmbeddedEngine, n: usize) -> f32 {
-        let mut prev = e.next_sample_stereo();
-        let mut maxd = 0.0f32;
-        for _ in 1..n {
-            let s = e.next_sample_stereo();
-            maxd = maxd
-                .max((s.left - prev.left).abs())
-                .max((s.right - prev.right).abs());
-            prev = s;
-        }
-        maxd
-    }
-
-    #[test]
-    fn synth_wide_slider_moves_do_not_click() {
-        let mut e = engine();
-        // Every sounding osc must be a clean low sine for the per-sample
-        // delta metric — saw/square/noise edges have legitimate fast deltas
-        // of their own that swamp the zipper measurement.
-        e.set_param(SynthParam::Osc1Waveform, 0.0); // Sine (voice idle -> direct)
-        e.set_param(SynthParam::Osc2Waveform, 0.0);
-        e.set_param(SynthParam::Osc2Semitones, 0.0);
-        e.set_param(SynthParam::Osc2Cents, 0.0);
-        e.set_param(SynthParam::Osc3Level, 0.0);
-        e.set_param(SynthParam::Osc4Level, 0.0);
-        e.receive_event(NoteEvent::note_on_midi(60, 110));
-        for _ in 0..8820 {
-            e.next_sample_stereo();
-        }
-        let changes: &[(SynthParam, f32)] = &[
-            (SynthParam::MasterVolume, 0.95),
-            (SynthParam::Osc2Level, 0.9),
-            (SynthParam::Osc2Pan, -0.85),
-            (SynthParam::Osc2Pw, 0.15),
-            (SynthParam::Osc2Semitones, 7.0),
-            (SynthParam::Osc2Cents, -30.0),
-            (SynthParam::FilterCutoff, 900.0),
-            (SynthParam::FilterResonance, 0.85),
-            (SynthParam::FilterEnvAmount, 0.8),
-            (SynthParam::LfoDepth, 0.8),
-            (SynthParam::LfoRate, 14.0),
-            (SynthParam::StereoWidth, 1.8),
-        ];
-        for &(p, v) in changes {
-            e.set_param(p, v);
-            let mut prev = e.next_sample_stereo();
-            let mut d = 0.0f32;
-            let mut at = 0usize;
-            let mut ch = 'l';
-            for i in 1..192 {
-                let s = e.next_sample_stereo();
-                let dl = (s.left - prev.left).abs();
-                let dr = (s.right - prev.right).abs();
-                if dl > d {
-                    d = dl;
-                    at = i;
-                    ch = 'l';
-                }
-                if dr > d {
-                    d = dr;
-                    at = i;
-                    ch = 'r';
-                }
-                prev = s;
-            }
-            assert!(
-                d < 0.05,
-                "{p:?} -> {v} clicked: max step {d} at i={at} ch={ch} prev={prev:?}"
-            );
-        }
-        // MIDI-style continuous controller sweeps: pitch bend, mod wheel,
-        // aftertouch and CC7 volume — all through the same event path.
-        for (kind, val) in [(0u8, 1.0f32), (1, 0.9), (2, 0.8)] {
-            match kind {
-                0 => e.receive_event(NoteEvent {
-                    kind: SynthEventKind::PitchBend(val),
-                    note: 0,
-                    velocity: 0.0,
-                }),
-                1 => e.receive_event(NoteEvent::control_change(1, 115)),
-                _ => e.receive_event(NoteEvent {
-                    kind: SynthEventKind::Aftertouch(val),
-                    note: 0,
-                    velocity: 0.0,
-                }),
-            }
-            let d = max_step(&mut e, 192);
-            assert!(d < 0.05, "continuous controller {kind} clicked: {d}");
-        }
-        e.receive_event(NoteEvent::control_change(7, 127));
-        let d = max_step(&mut e, 192);
-        assert!(d < 0.05, "CC7 volume clicked: {d}");
-    }
-
-    #[test]
-    fn fx_toggle_and_param_jumps_declick() {
-        let mut e = engine();
-        // Clean-sine source so the delta metric isolates the FX gates, not
-        // the saw/square edges in the default patch.
-        e.set_param(SynthParam::Osc1Waveform, 0.0);
-        e.set_param(SynthParam::Osc2Level, 0.0);
-        e.set_param(SynthParam::Osc3Level, 0.0);
-        e.set_param(SynthParam::Osc4Level, 0.0);
-        e.receive_event(NoteEvent::note_on_midi(60, 110));
-        for _ in 0..8820 {
-            e.next_sample_stereo();
-        }
-        // Stomp each effect on mid-note — the bypass gate must fade in.
-        for (name, action) in [
-            ("delay", 0),
-            ("reverb", 1),
-            ("chorus", 2),
-            ("distortion", 3),
-        ] {
-            match action {
-                0 => e.effects.set_delay_enabled(true),
-                1 => e.effects.set_reverb_enabled(true),
-                2 => e.effects.set_chorus_enabled(true),
-                _ => e.effects.set_distortion_enabled(true),
-            }
-            let d = max_step(&mut e, 192);
-            assert!(d < 0.05, "{name} enable clicked: {d}");
-        }
-        // Hard jumps on every effect slider while audio is running.
-        e.effects.set_delay_time(0.05);
-        e.effects.set_delay_feedback(0.9);
-        e.effects.set_delay_mix(0.8);
-        e.effects.set_reverb_room_size(0.95);
-        e.effects.set_reverb_damping(0.9);
-        e.effects.set_reverb_mix(0.8);
-        e.effects.set_chorus_rate(4.5);
-        e.effects.set_chorus_depth(9.0);
-        e.effects.set_chorus_mix(0.9);
-        e.effects.set_distortion_drive(0.95);
-        e.effects.set_distortion_mix(0.9);
-        e.effects.set_distortion_type(DistortionType::Fuzz);
-        for _ in 0..32 {
-            let d = max_step(&mut e, 64);
-            assert!(d < 0.08, "fx param jump clicked: {d}");
-        }
-        // Stomp everything off — fade-outs must replace the old hard cut.
-        // A hard-clipped Fuzz signal has large legitimate per-sample deltas of
-        // its own, so the post-disable step must not exceed the pre-disable
-        // wet step (the fade cannot add more than the signal itself).
-        // Long window: rare hard-clipped Fuzz edges must be captured so the
-        // comparison baseline reflects the true wet-signal step size.
-        let wet_step = max_step(&mut e, 2048);
-        e.effects.set_delay_enabled(false);
-        e.effects.set_reverb_enabled(false);
-        e.effects.set_chorus_enabled(false);
-        e.effects.set_distortion_enabled(false);
-        for _ in 0..64 {
-            let d = max_step(&mut e, 64);
-            assert!(
-                d <= wet_step + 0.02,
-                "fx disable added a step beyond the wet signal: {d} vs {wet_step}"
-            );
-        }
-        // After the ~11 ms gates converge, output converges to the clean dry
-        // path again (tight delta on a sine).
-        for _ in 0..4410 {
-            e.next_sample_stereo();
-        }
-        let d = max_step(&mut e, 256);
-        assert!(d < 0.05, "post-disable output not clean: {d}");
-    }
-
-    #[test]
-    fn waveform_filter_mode_and_preset_switches_stay_smooth() {
-        let mut e = engine();
-        e.receive_event(NoteEvent::note_on_midi(57, 120));
-        for _ in 0..8820 {
-            e.next_sample_stereo();
-        }
-        // Waveform swaps dip that osc instead of discontinuing the output.
-        e.set_param(SynthParam::Osc1Waveform, 2.0); // Sine -> Saw
-        let d = max_step(&mut e, 256);
-        assert!(d < 0.05, "waveform swap clicked: {d}");
-        // Filter mode switch crossfades between mode outputs.
-        e.set_filter_mode(FilterMode::HighPass);
-        let d = max_step(&mut e, 256);
-        assert!(d < 0.05, "filter mode switch clicked: {d}");
-        // Preset load while notes ring: everything glides, output bounded.
-        let mut p = Preset::default();
-        p.osc1_waveform = WaveformType::Saw;
-        p.filter_cutoff = 1200.0;
-        p.filter_resonance = 0.6;
-        p.master_volume = 1.0;
-        p.delay_enabled = true;
-        p.reverb_enabled = true;
-        e.apply_preset(&p);
-        let mut peak = 0.0f32;
-        for _ in 0..4096 {
-            let s = e.next_sample_stereo();
-            assert!(s.left.is_finite() && s.right.is_finite());
-            peak = peak.max(s.left.abs()).max(s.right.abs());
-        }
-        assert!(peak <= 1.0, "post-preset peak {peak} out of bounds");
     }
 }

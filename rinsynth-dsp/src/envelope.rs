@@ -217,7 +217,6 @@ pub struct ADSREnvelope {
     attack_increment: f32,
     decay_decrement: f32,
     release_decrement: f32,
-    sustain_slew: f32,
 }
 
 impl ADSREnvelope {
@@ -239,7 +238,6 @@ impl ADSREnvelope {
             attack_increment: 0.0,
             decay_decrement: 0.0,
             release_decrement: 0.0,
-            sustain_slew: 0.005,
         };
         env.update_increments();
         env
@@ -256,8 +254,6 @@ impl ADSREnvelope {
         self.decay_decrement = (1.0 - self.sustain_level) / (self.decay_time * samples_per_second);
         // Release decrement is recalculated in release() based on current amplitude
         self.release_decrement = self.sustain_level / (self.release_time * samples_per_second);
-        // ~5 ms one-pole slew when Sustain slider moves during a held note
-        self.sustain_slew = (200.0 / samples_per_second.max(1.0)).clamp(0.001, 1.0);
     }
 }
 
@@ -284,8 +280,7 @@ impl Envelope for ADSREnvelope {
                 }
             }
             EnvelopeState::Sustain => {
-                self.current_amplitude +=
-                    self.sustain_slew * (self.sustain_level - self.current_amplitude);
+                self.current_amplitude = self.sustain_level;
             }
             EnvelopeState::Release => {
                 self.current_amplitude -= self.release_decrement;
