@@ -295,6 +295,9 @@ pub struct LeanVoice {
     gliding: bool,
     velocity: Amplitude,
     note: MidiNote,
+    /// KeyTrack mod value for the sounding note — computed once in
+    /// note_on (the note can't change while the voice is active).
+    key_track: f32,
     active: bool,
     age: u64,
     control_phase: u32,
@@ -385,6 +388,7 @@ impl LeanVoice {
             gliding: false,
             velocity: 0.0,
             note: 0,
+            key_track: 0.0,
             active: false,
             age: u64::MAX,
             control_phase: 0,
@@ -445,6 +449,10 @@ impl LeanVoice {
         let was_active = self.active && self.amp_env.state() != EnvelopeState::Idle;
         let freq = midi_to_frequency(note);
         self.note = note;
+        // KeyTrack modulation source: fixed for the life of the note —
+        // precompute here instead of paying a soft-float divide every
+        // control tick a matrix slot exists.
+        self.key_track = ((note as f32 - 60.0) / 60.0).clamp(-1.0, 1.0);
         self.velocity = velocity.clamp(0.0, 1.0);
         self.active = true;
         self.age = age;
@@ -546,7 +554,18 @@ impl LeanVoice {
         aftertouch: f32,
         active_slots: &[ModSlot],
     ) {
-        self.env3_amp = self.env3.next_amplitude();
+        // Env3's tick is only paid when a matrix slot actually sources it
+        // — same pattern as fenv_used on the per-sample path. When unused
+        // the envelope freezes wherever it is; if a slot is routed to it
+        // later it simply resumes from there.
+        let env3_used = active_slots
+            .iter()
+            .any(|s| matches!(s.source, ModSource::Env3 | ModSource::Env4));
+        self.env3_amp = if env3_used {
+            self.env3.next_amplitude()
+        } else {
+            0.0
+        };
         let eff_depth = (self.lfo_depth + mod_wheel * 0.6).clamp(0.0, 1.0);
         self.lfo.set_depth(eff_depth);
         let lfo1 = self.lfo.next_value(); // -eff_depth..eff_depth
@@ -576,7 +595,7 @@ impl LeanVoice {
         let mut pw_dirty = false;
 
         if !active_slots.is_empty() {
-            let key_track = ((self.note as f32 - 60.0) / 60.0).clamp(-1.0, 1.0);
+            let key_track = self.key_track;
             for s in active_slots {
                 let src = match s.source {
                     ModSource::Off => 0.0,
