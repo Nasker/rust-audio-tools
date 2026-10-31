@@ -51,6 +51,12 @@ const MAX_OSCS: usize = 4;
 const OSC_GAIN: f32 = 0.085;
 /// Mono-mode key stack capacity (last-note priority, newest on top).
 const KEY_STACK_CAP: usize = 16;
+/// Physical voice slots. Kept as an inline array — not a `Vec` — so the hot
+/// per-sample voice state lives wherever the engine struct lives (the audio
+/// task's internal-RAM stack on ESP32-S3) instead of a >1 KB heap alloc that
+/// prefers PSRAM under `SPIRAM_MALLOC_ALWAYSINTERNAL`. `pool_len` bounds the
+/// usable subset; slots above it stay permanently inactive.
+const MAX_VOICE_POOL: usize = 8;
 
 /// Cycle-count a pipeline stage when a profiler hook is installed; a single
 /// predictable branch per call otherwise.
@@ -902,7 +908,8 @@ impl LeanVoice {
 }
 
 pub struct EmbeddedEngine {
-    voices: Vec<LeanVoice>,
+    voices: [LeanVoice; MAX_VOICE_POOL],
+    pool_len: usize,
     pub effects: EffectsChain,
     pub mod_matrix: ModMatrix,
     active_slots: [ModSlot; MOD_SLOTS],
@@ -944,7 +951,8 @@ pub struct EmbeddedEngine {
 impl EmbeddedEngine {
     pub fn new(max_voices: usize, sample_rate: SampleRate) -> Self {
         Self {
-            voices: (0..max_voices).map(|_| LeanVoice::new(sample_rate)).collect(),
+            voices: std::array::from_fn(|_| LeanVoice::new(sample_rate)),
+            pool_len: max_voices.min(MAX_VOICE_POOL),
             effects: EffectsChain::new(sample_rate),
             mod_matrix: ModMatrix::default(),
             active_slots: [ModSlot::default(); MOD_SLOTS],
@@ -965,7 +973,7 @@ impl EmbeddedEngine {
             unison_spread: 0.7,
             age_counter: 0,
             stereo_width: 1.0,
-            voice_cap: max_voices,
+            voice_cap: max_voices.min(MAX_VOICE_POOL),
             bpm: 120.0,
             lfo1_rate: 4.0,
             lfo1_sync: false,
@@ -1000,7 +1008,7 @@ impl EmbeddedEngine {
     /// first `cap` slots. Voices above the cap that are already sounding keep
     /// their tails; shed them explicitly with `shed_voice`.
     pub fn set_voice_cap(&mut self, n: usize) {
-        self.voice_cap = n.clamp(1, self.voices.len());
+        self.voice_cap = n.clamp(1, self.pool_len);
     }
 
     pub fn voice_cap(&self) -> usize {
@@ -1027,7 +1035,7 @@ impl EmbeddedEngine {
 
     /// Mono-mode unison stack size (1..=voice count).
     pub fn set_unison_count(&mut self, n: usize) {
-        self.unison_count = n.clamp(1, self.voices.len());
+        self.unison_count = n.clamp(1, self.pool_len);
     }
 
     /// Unison pitch spread in cents (max deviation at the stack edges).
@@ -1051,7 +1059,7 @@ impl EmbeddedEngine {
     fn trigger_mono(&mut self, note: MidiNote, velocity: Amplitude) {
         let n = self
             .unison_count
-            .clamp(1, self.voice_cap.min(self.voices.len()));
+            .clamp(1, self.voice_cap.min(self.pool_len));
         let det = self.unison_detune;
         let spr = self.unison_spread;
         let portamento = self.portamento;
@@ -1867,7 +1875,7 @@ impl EmbeddedEngine {
         //    it) and the fresh age protects the new note from the next shed.
         //    An idle excess slot is NOT taken: a note there would be the only
         //    held excess voice and thus the governor's first shed candidate.
-        if self.voice_cap < self.voices.len() {
+        if self.voice_cap < self.pool_len {
             let excess = &self.voices[self.voice_cap..];
             let lowest = self.voices.iter().filter(|v| v.active).map(|v| v.note).min();
             if let Some((i, _)) = excess
@@ -1907,7 +1915,7 @@ impl EmbeddedEngine {
         let active_slots = &self.active_slots[..self.num_active_slots];
         let mut l = 0.0f32;
         let mut r = 0.0f32;
-        for v in &mut self.voices {
+        for v in &mut self.voices[..self.pool_len] {
             if v.active {
                 let s = v.next_stereo(bend_norm, bend_semi, mod_wheel, aftertouch, active_slots);
                 l += s.left;
