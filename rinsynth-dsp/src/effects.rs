@@ -35,9 +35,18 @@ pub trait StereoEffect: Send {
 // DELAY
 // ============================================================================
 
-/// Simple power-of-two delay line buffer for branchless bitmask indexing
+/// Simple power-of-two delay line buffer for branchless bitmask indexing.
+/// Storage is scaled i16 (Stage 3, FIXEDPOINT_PLAN.md): halves the PSRAM
+/// footprint and dirty-line writeback traffic of the big ping-pong lines
+/// vs f32. Scale 1/8 gives ±8.0 headroom — ping-pong feedback sums can
+/// exceed unity on hot transients but stay ≪8 in music; worst case is a
+/// saturated repeat, never a clipped dry path. ~12-bit effective precision
+/// (−72 dB floor) sits under the decaying echo noise floor.
+const DL_SCALE: f32 = 4096.0;
+const DL_UNSCALE: f32 = 1.0 / DL_SCALE;
+
 struct DelayLine {
-    buffer: Vec<Sample>,
+    buffer: Vec<i16>,
     mask: usize,
     write_pos: usize,
 }
@@ -47,7 +56,7 @@ impl DelayLine {
         let min_size = (max_delay_seconds * sample_rate as f32) as usize + 2;
         let size = min_size.next_power_of_two();
         Self {
-            buffer: vec![0.0; size],
+            buffer: vec![0; size],
             mask: size - 1,
             write_pos: 0,
         }
@@ -55,13 +64,14 @@ impl DelayLine {
 
     #[inline(always)]
     fn write(&mut self, sample: Sample) {
-        self.buffer[self.write_pos] = sample;
+        self.buffer[self.write_pos] =
+            (sample * DL_SCALE).clamp(-32768.0, 32767.0) as i16;
         self.write_pos = (self.write_pos + 1) & self.mask;
     }
 
     #[inline(always)]
     fn read(&self, delay_samples: usize) -> Sample {
-        self.buffer[self.write_pos.wrapping_sub(delay_samples) & self.mask]
+        self.buffer[self.write_pos.wrapping_sub(delay_samples) & self.mask] as f32 * DL_UNSCALE
     }
 
     #[inline(always)]
@@ -70,13 +80,13 @@ impl DelayLine {
         let frac = delay_samples - delay_int as f32;
         let i0 = self.write_pos.wrapping_sub(delay_int) & self.mask;
         let i1 = i0.wrapping_sub(1) & self.mask;
-        let s1 = self.buffer[i0];
-        let s2 = self.buffer[i1];
-        s1 + frac * (s2 - s1)
+        let s1 = self.buffer[i0] as f32;
+        let s2 = self.buffer[i1] as f32;
+        (s1 + frac * (s2 - s1)) * DL_UNSCALE
     }
 
     fn clear(&mut self) {
-        self.buffer.fill(0.0);
+        self.buffer.fill(0);
         self.write_pos = 0;
     }
 }
@@ -1059,5 +1069,61 @@ mod tests {
                 fx.process_stereo(StereoSample::from_mono(s)).left
             })
             .collect()
+    }
+
+    /// Stage 3 gate: Q15 delay storage must not stall the tail — a ping-pong
+    /// echo at high feedback keeps decaying past the quantization floor
+    /// instead of limit-cycling or hanging.
+    #[test]
+    fn delay_tail_decays_through_q15_floor() {
+        let mut d = Delay::new(44100);
+        d.set_delay_time(0.05);
+        d.set_feedback(0.9);
+        d.set_mix(1.0);
+        d.set_ping_pong(false);
+        // One impulse, then silence — track the echo envelope.
+        let mut peaks = Vec::new();
+        let mut peak = 0.0f32;
+        for i in 0..44100 * 4 {
+            let input = if i == 0 { 0.8 } else { 0.0 };
+            let out = d.process_stereo(StereoSample::from_mono(input));
+            peak = peak.max(out.left.abs()).max(out.right.abs());
+            if (i + 1) % 4410 == 0 {
+                peaks.push(peak);
+                peak = 0.0;
+            }
+        }
+        // Audible echoes for ~2 s, then below −60 dBFS, then silent —
+        // monotone-ish decay, never a stuck limit cycle above −72 dB.
+        assert!(peaks[0] > 0.05, "first echo too quiet: {}", peaks[0]);
+        assert!(peaks[10] > 1e-4, "echoes died early: {:?}", &peaks[..12]);
+        assert!(
+            peaks[30] < 1e-3,
+            "tail not decaying — limit cycle? peaks={:?}",
+            &peaks[28..]
+        );
+        assert!(
+            peaks[39] < 1e-4,
+            "tail stuck at quantization floor: {}",
+            peaks[39]
+        );
+    }
+
+    /// Stage 3 gate: stored-sample quantization must not bleed into the dry
+    /// path — chorus at mix=0 and delay at mix=0 stay bit-transparent.
+    #[test]
+    fn dry_path_unaffected_by_q15_storage() {
+        let mut d = Delay::new(44100);
+        d.set_mix(0.0);
+        let mut c = Chorus::new(44100);
+        c.set_mix(0.0);
+        for i in 0..2048 {
+            let s = ((i as f32) * 0.05).sin() * 0.7;
+            let inp = StereoSample::from_mono(s);
+            let od = d.process_stereo(inp);
+            let oc = c.process_stereo(inp);
+            assert_eq!(od.left, s);
+            assert_eq!(oc.left, s);
+        }
     }
 }
