@@ -75,6 +75,12 @@ macro_rules! pstage {
 
 /// PolyBLEP residual for a discontinuity at phase 0 (normalized t ∈ [0,1)).
 /// For pulse waves call again with the second edge's phase.
+/// NOTE: two alternate osc paths were built, flashed, and FALSIFIED on
+/// hardware (FIXEDPOINT_PLAN.md): multi-octave wavetables (~25% slower —
+/// PSRAM loads beat nothing when the FPU does BLEP in a few cycles) and a
+/// full Q31 integer path (~15% slower — Xtensa has no 64-bit mul, so the
+/// i64 intermediates cost more than the float ops they replaced). The f32
+/// PolyBLEP below is the measured winner on LX7 — the FPU handles it fine.
 #[inline(always)]
 fn poly_blep(t: f32, dt: f32) -> f32 {
     if t < dt {
@@ -86,6 +92,15 @@ fn poly_blep(t: f32, dt: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Eagerly initialize the lazy 8 KB f32 sine LUT — its OnceLock init builds
+/// the table as a stack temporary, and the audio task's stack can only
+/// spare one of those at a time (stack overflow crash on first render
+/// otherwise, observed on hardware). Call from a big-stack init context
+/// before audio starts.
+pub fn prewarm_dsp_tables() {
+    sine_lut(0.0);
 }
 
 /// Fixed-pipeline oscillator: one struct, waveform chosen by a match —
