@@ -641,6 +641,14 @@ pub fn factory_presets() -> Vec<Preset> {
     let mut bank = original_factory_presets();
     super::factory_bank::renew(&mut bank);
     bank.extend(super::factory_bank::extended());
+    // Leads and basses are monophonic instruments — voice them as such by
+    // default regardless of source (original, renewed, or extended bank).
+    // A preset can still opt out via the poly toggle after loading.
+    for p in &mut bank {
+        if p.category == "Bass" || p.category == "Lead" {
+            p.polyphony_mode = PolyphonyMode::Mono;
+        }
+    }
     bank
 }
 
