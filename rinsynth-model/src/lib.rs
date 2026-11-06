@@ -11,6 +11,7 @@
 //! - `host-fs` — `fs` + desktop conveniences (`dirs`-based preset directory,
 //!               `load_preset`/`save_preset`/`list_*`/`install_factory_presets`).
 
+pub mod arp;
 pub mod effects;
 pub mod event;
 pub mod factory_bank;
@@ -23,6 +24,7 @@ pub mod presets;
 pub mod types;
 pub mod voice;
 
+pub use arp::ArpMode;
 pub use effects::DistortionType;
 pub use event::{
     NoteEvent, NoteEventKind, SynthEvent, SynthEventKind, SynthEventReceiver, WaveformType,

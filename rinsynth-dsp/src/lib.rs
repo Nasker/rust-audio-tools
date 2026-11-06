@@ -6,6 +6,7 @@
 //! this is the audio hot path and must build fully optimized (see the
 //! Xtensa LLVM-21 serde-f32 codegen issue, esp-rs/rust#277).
 
+pub mod arpeggiator;
 pub mod effects;
 pub mod embedded;
 pub mod envelope;
@@ -13,6 +14,7 @@ pub mod filter;
 pub mod oscillator;
 pub mod voice;
 
+pub use arpeggiator::Arpeggiator;
 pub use effects::{Chorus, Delay, Distortion, Effect, EffectsChain, Reverb};
 pub use embedded::EmbeddedEngine;
 pub use envelope::{ADSREnvelope, AREnvelope, Envelope, EnvelopeState};

@@ -4,6 +4,7 @@ use std::fs;
 #[cfg(feature = "fs")]
 use std::path::Path;
 
+use super::arp::ArpMode;
 use super::effects::DistortionType;
 use super::event::WaveformType;
 use super::filter::FilterType;
@@ -180,6 +181,19 @@ pub struct Preset {
     #[serde(default = "default_unison_spread")]
     pub unison_spread: f32,
 
+    // Arpeggiator — a block-boundary note scheduler (no per-sample DSP cost).
+    // Serde-defaulted off so all existing presets deserialize unchanged.
+    #[serde(default)]
+    pub arp_on: bool,
+    #[serde(default)]
+    pub arp_mode: ArpMode,
+    /// Beats per arp step (0.25 = 1/16 note, 0.5 = 1/8, 1.0 = 1/4).
+    #[serde(default = "default_arp_rate")]
+    pub arp_rate: f32,
+    /// Octave span of the arpeggiated sequence (1..=4).
+    #[serde(default = "default_arp_oct")]
+    pub arp_oct: u8,
+
     // Effects - Distortion
     #[serde(default)]
     pub distortion_enabled: bool,
@@ -350,6 +364,12 @@ impl Default for Preset {
             chorus_depth: 0.5,
             chorus_mix: 0.3,
 
+            // Arpeggiator (default off)
+            arp_on: false,
+            arp_mode: ArpMode::Up,
+            arp_rate: 0.25,
+            arp_oct: 1,
+
             // Master
             master_volume: 0.5,
         }
@@ -481,6 +501,14 @@ fn default_unison_detune() -> f32 {
 
 fn default_unison_spread() -> f32 {
     0.7
+}
+
+fn default_arp_rate() -> f32 {
+    0.25
+}
+
+fn default_arp_oct() -> u8 {
+    1
 }
 
 fn default_osc4_waveform() -> WaveformType {
