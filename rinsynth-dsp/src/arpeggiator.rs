@@ -35,6 +35,10 @@ pub struct Arpeggiator {
     rate_beats: f32,
     /// Octave span applied upward over the held chord (1..=4).
     octaves: u8,
+    /// Latch mode: held notes are never released by NoteOff — the chord
+    /// keeps arpeggiating after the keys are let go. Releasing hold drops
+    /// the latched chord (and silences the sounding step note).
+    hold: bool,
     /// Held (note, velocity) pairs sorted ascending by note.
     held: [(MidiNote, f32); MAX_HELD],
     held_len: usize,
@@ -70,6 +74,7 @@ impl Arpeggiator {
             mode: ArpMode::Up,
             rate_beats: 0.25,
             octaves: 1,
+            hold: false,
             held: [(0, 0.0); MAX_HELD],
             held_len: 0,
             seq_len: 0,
@@ -101,11 +106,40 @@ impl Arpeggiator {
 
     /// Apply the arp fields of a preset (called right after
     /// `EmbeddedEngine::apply_preset` — keeps arp state in the patch).
+    ///
+    /// **Preset-agnostic by design**: only a preset that explicitly ships
+    /// `arp_on = true` applies arp settings. Presets can arm/configure the
+    /// arp, but never force it off or stomp the player's live settings —
+    /// the arp survives preset browsing.
     pub fn apply_preset(&mut self, p: &Preset) {
+        if !p.arp_on {
+            return;
+        }
         self.set_mode(p.arp_mode);
         self.set_rate_beats(p.arp_rate);
         self.set_octaves(p.arp_oct);
-        self.set_enabled(p.arp_on);
+        self.set_hold(p.arp_hold);
+        self.set_enabled(true);
+    }
+
+    pub fn hold_enabled(&self) -> bool {
+        self.hold
+    }
+
+    /// Latch mode. Engaging keeps the current held chord; releasing drops
+    /// every latched note (silencing the sounding step note) so the next
+    /// keypress starts a fresh chord — classic arp-hold semantics.
+    pub fn set_hold(&mut self, hold: bool) {
+        self.hold = hold;
+        if !hold {
+            self.held_len = 0;
+            self.seq_len = 0;
+            self.step_idx = 0;
+            self.trigger_now = false;
+            if let Some(n) = self.playing.take() {
+                self.off_pending = Some(n);
+            }
+        }
     }
 
     pub fn set_enabled(&mut self, on: bool) {
@@ -177,6 +211,11 @@ impl Arpeggiator {
     pub fn note_off(&mut self, note: MidiNote) -> Option<NoteEvent> {
         for i in 0..self.held_len {
             if self.held[i].0 == note {
+                if self.hold {
+                    // Latch: the key physically released but the note stays
+                    // in the pattern until hold is switched off.
+                    return None;
+                }
                 self.held.copy_within(i + 1..self.held_len, i);
                 self.held_len -= 1;
                 self.seq_len = self.held_len * self.octaves as usize;
@@ -456,6 +495,69 @@ mod tests {
         // Note 72 was struck before the arp engaged — its release must be
         // forwarded or the engine voice would hang forever.
         assert!(a.note_off(72).is_some());
+    }
+
+    #[test]
+    fn hold_latches_chord_after_release() {
+        let mut a = Arpeggiator::new();
+        a.set_enabled(true);
+        a.set_hold(true);
+        a.set_rate_beats(0.25);
+        a.note_on(48, 1.0);
+        a.note_on(64, 1.0);
+        let _ = collect(&mut a, 100, 120.0);
+        // Release every key — the latched chord keeps arpeggiating.
+        assert!(a.note_off(48).is_none());
+        assert!(a.note_off(64).is_none());
+        let mut notes = ons(&collect(&mut a, 256, 120.0));
+        for _ in 0..10 {
+            notes.extend(ons(&collect(&mut a, 5513, 120.0)));
+        }
+        assert!(notes.iter().all(|&n| n == 48 || n == 64));
+        assert!(notes.len() > 4, "latch should keep stepping");
+    }
+
+    #[test]
+    fn releasing_hold_drops_latched_chord() {
+        let mut a = Arpeggiator::new();
+        a.set_enabled(true);
+        a.set_hold(true);
+        a.note_on(60, 1.0);
+        let _ = collect(&mut a, 100, 120.0);
+        a.note_off(60); // latched
+        a.set_hold(false);
+        let evs = collect(&mut a, 6000, 120.0);
+        // The sounding step note is released, then the arp stays silent.
+        assert!(evs
+            .iter()
+            .any(|e| e.kind == rinsynth_model::event::SynthEventKind::NoteOff && e.note == 60));
+        assert!(collect(&mut a, 6000, 120.0).is_empty());
+    }
+
+    #[test]
+    fn preset_application_is_opt_in() {
+        let mut a = Arpeggiator::new();
+        a.set_enabled(true);
+        a.set_mode(ArpMode::Down);
+        a.set_rate_beats(0.5);
+        // A preset that doesn't ship arp config must not touch live state.
+        let mut p = Preset::default();
+        p.arp_on = false;
+        a.apply_preset(&p);
+        assert!(a.enabled());
+        assert_eq!(a.mode(), ArpMode::Down);
+        assert_eq!(a.rate_beats(), 0.5);
+        // A preset that opts in takes over completely.
+        p.arp_on = true;
+        p.arp_mode = ArpMode::UpDown;
+        p.arp_rate = 0.125;
+        p.arp_oct = 2;
+        p.arp_hold = true;
+        a.apply_preset(&p);
+        assert_eq!(a.mode(), ArpMode::UpDown);
+        assert_eq!(a.rate_beats(), 0.125);
+        assert_eq!(a.octaves(), 2);
+        assert!(a.hold_enabled());
     }
 
     #[test]

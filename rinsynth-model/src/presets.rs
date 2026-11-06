@@ -193,6 +193,9 @@ pub struct Preset {
     /// Octave span of the arpeggiated sequence (1..=4).
     #[serde(default = "default_arp_oct")]
     pub arp_oct: u8,
+    /// Latch mode: held notes keep arpeggiating after the keys release.
+    #[serde(default)]
+    pub arp_hold: bool,
 
     // Effects - Distortion
     #[serde(default)]
@@ -369,6 +372,7 @@ impl Default for Preset {
             arp_mode: ArpMode::Up,
             arp_rate: 0.25,
             arp_oct: 1,
+            arp_hold: false,
 
             // Master
             master_volume: 0.5,
