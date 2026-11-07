@@ -28,6 +28,13 @@ pub const MAX_HELD: usize = 16;
 /// between hits — classic arp feel; 1.0 would run notes into each other).
 const GATE: f32 = 0.8;
 
+/// Chord-capture window for HOLD mode, in seconds. With hold engaged,
+/// notes arriving within this span of the previous NoteOn merge into one
+/// chord; a NoteOn after the gap (or after every key was released)
+/// *replaces* the latched chord instead of piling onto it — the arp
+/// always walks the last chord played, never an endless accumulation.
+const CHORD_WINDOW_S: f32 = 1.5;
+
 pub struct Arpeggiator {
     enabled: bool,
     mode: ArpMode,
@@ -42,6 +49,14 @@ pub struct Arpeggiator {
     /// Held (note, velocity) pairs sorted ascending by note.
     held: [(MidiNote, f32); MAX_HELD],
     held_len: usize,
+    /// Physically pressed keys right now (independent of the latch).
+    /// Reaching 0 commits the chord — the next NoteOn starts a new one.
+    keys_down: u8,
+    /// Synth-rate samples elapsed since the last NoteOn (chord window).
+    chord_age: f32,
+    /// Sample rate from the last [`tick`](Self::tick) — converts
+    /// `CHORD_WINDOW_S` to samples in `note_on` (which has no clock).
+    sample_rate: f32,
     /// Expanded sequence length = held_len × octaves.
     seq_len: usize,
     /// Current position in the expanded sequence.
@@ -77,6 +92,9 @@ impl Arpeggiator {
             hold: false,
             held: [(0, 0.0); MAX_HELD],
             held_len: 0,
+            keys_down: 0,
+            chord_age: f32::MAX,
+            sample_rate: 44_100.0,
             seq_len: 0,
             step_idx: 0,
             updown_fwd: true,
@@ -152,6 +170,8 @@ impl Arpeggiator {
             self.seq_len = 0;
             self.step_idx = 0;
             self.trigger_now = false;
+            self.keys_down = 0;
+            self.chord_age = f32::MAX;
         }
         self.enabled = on;
     }
@@ -177,6 +197,22 @@ impl Arpeggiator {
     /// Feed a NoteOn. Called only when enabled (the host passes events
     /// straight to the engine when the arp is off).
     pub fn note_on(&mut self, note: MidiNote, velocity: f32) {
+        self.keys_down = self.keys_down.saturating_add(1);
+        let chord_expired = self.chord_age > CHORD_WINDOW_S * self.sample_rate;
+        if self.hold && self.held_len > 0 && (self.keys_down == 1 || chord_expired) {
+            // Last-chord semantics: all keys were released (or the capture
+            // window lapsed) since the latched chord — start a fresh chord
+            // instead of accumulating. Silence the sounding step note so
+            // its voice can't leak when `playing` is overwritten below.
+            self.held_len = 0;
+            self.seq_len = 0;
+            self.step_idx = 0;
+            self.updown_fwd = true;
+            if let Some(n) = self.playing.take() {
+                self.off_pending = Some(n);
+            }
+        }
+        self.chord_age = 0.0;
         if self.held_len >= MAX_HELD {
             return;
         }
@@ -209,6 +245,7 @@ impl Arpeggiator {
     /// when the note was **not** part of the held chord — e.g. a note
     /// struck before the arp was enabled must still release its voice.
     pub fn note_off(&mut self, note: MidiNote) -> Option<NoteEvent> {
+        self.keys_down = self.keys_down.saturating_sub(1);
         for i in 0..self.held_len {
             if self.held[i].0 == note {
                 if self.hold {
@@ -246,6 +283,8 @@ impl Arpeggiator {
         sample_rate: f32,
         emit: &mut impl FnMut(NoteEvent),
     ) {
+        self.sample_rate = sample_rate;
+        self.chord_age += n_samples as f32;
         if let Some(n) = self.off_pending.take() {
             emit(NoteEvent::note_off(n));
         }
@@ -515,6 +554,85 @@ mod tests {
         }
         assert!(notes.iter().all(|&n| n == 48 || n == 64));
         assert!(notes.len() > 4, "latch should keep stepping");
+    }
+
+    #[test]
+    fn hold_new_chord_replaces_latched() {
+        let mut a = Arpeggiator::new();
+        a.set_enabled(true);
+        a.set_hold(true);
+        a.set_rate_beats(0.25);
+        a.note_on(48, 1.0);
+        a.note_on(64, 1.0);
+        let _ = collect(&mut a, 100, 120.0);
+        // Release every key — the next press starts a NEW chord.
+        a.note_off(48);
+        a.note_off(64);
+        a.note_on(50, 1.0);
+        let mut notes = ons(&collect(&mut a, 100, 120.0));
+        for _ in 0..6 {
+            notes.extend(ons(&collect(&mut a, 5513, 120.0)));
+        }
+        assert!(notes.iter().all(|&n| n == 50), "got {:?}", notes);
+        assert!(notes.len() >= 3);
+    }
+
+    #[test]
+    fn hold_chord_window_expiry_replaces() {
+        let mut a = Arpeggiator::new();
+        a.set_enabled(true);
+        a.set_hold(true);
+        a.set_rate_beats(0.25);
+        a.note_on(48, 1.0);
+        let _ = collect(&mut a, 100, 120.0);
+        // Key 48 is still physically held, but >1.5 s passes — the next
+        // NoteOn is a fresh chord (legato overlap can't glue in stale notes).
+        let _ = collect(&mut a, (SR * 2.0) as u32, 120.0);
+        a.note_on(60, 1.0);
+        let mut notes = ons(&collect(&mut a, 100, 120.0));
+        for _ in 0..6 {
+            notes.extend(ons(&collect(&mut a, 5513, 120.0)));
+        }
+        assert!(notes.iter().all(|&n| n == 60), "got {:?}", notes);
+    }
+
+    #[test]
+    fn hold_notes_within_window_merge_into_chord() {
+        let mut a = Arpeggiator::new();
+        a.set_enabled(true);
+        a.set_hold(true);
+        a.set_rate_beats(0.25);
+        a.note_on(48, 1.0);
+        a.note_on(64, 1.0);
+        let _ = collect(&mut a, 100, 120.0);
+        a.note_off(48); // key 64 still held — chord not committed yet
+        // Press a third note while one key is still down: same chord.
+        a.note_on(67, 1.0);
+        let mut notes = ons(&collect(&mut a, 100, 120.0));
+        for _ in 0..9 {
+            notes.extend(ons(&collect(&mut a, 5513, 120.0)));
+        }
+        assert!(notes.iter().all(|&n| n == 48 || n == 64 || n == 67));
+        assert!(notes.iter().any(|&n| n == 67));
+    }
+
+    #[test]
+    fn replacing_chord_releases_old_sounding_note() {
+        let mut a = Arpeggiator::new();
+        a.set_enabled(true);
+        a.set_hold(true);
+        a.set_rate_beats(0.25);
+        a.note_on(48, 1.0);
+        let _ = collect(&mut a, 100, 120.0); // 48 is sounding
+        a.note_off(48); // latched
+        a.note_on(50, 1.0); // replaces the chord
+        let evs = collect(&mut a, 100, 120.0);
+        assert!(evs
+            .iter()
+            .any(|e| e.kind == rinsynth_model::event::SynthEventKind::NoteOff && e.note == 48));
+        assert!(evs
+            .iter()
+            .any(|e| e.kind == rinsynth_model::event::SynthEventKind::NoteOn && e.note == 50));
     }
 
     #[test]
