@@ -1,0 +1,4 @@
+/target/
+**/test_*.png
+.idea/
+.DS_Store
