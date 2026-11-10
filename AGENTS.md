@@ -46,11 +46,12 @@ opt-level=0 workaround for Xtensa serde-f32 code generation; DSP remains optimiz
 
 ## Dependency and history policy
 
-Consumers currently use sibling path dependencies into this workspace. Once a
-remote exists, reproducible releases should pin both crates to the same Git
-revision; local development can use Cargo patches. No remote is configured yet.
-Do not publish or guess a remote URL. Do not maintain a second editable copy in
-an application repository.
+Consumers currently use sibling path dependencies into this workspace. The
+origin remote is `git@github.com:Nasker/rust-audio-tools.git`. Keep the local
+checkout named `audio-tools` to preserve those paths. Reproducible releases should
+pin both crates to the same tested Git revision once pushed; local development
+can use Cargo patches. Do not push without explicit user approval. Do not maintain
+a second editable copy in an application repository.
 
 History was extracted from RustInSynth's `crates/` subtree at source commit
 `d30718b` (split commit `d624512eac8d046b87ebb18fb3c682c6653c2600`). Historical
